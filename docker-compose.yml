@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: soundbox_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: iot_soundbox
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: StrongPasswordHere2026
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./PostgreSQL.sql:/docker-entrypoint-initdb.d/init.sql
+
+  emqx:
+    image: emqx/emqx:5.3.0
+    container_name: soundbox_emqx
+    restart: always
+    ports:
+      - "1883:1883"
+      - "18083:18083"
+    environment:
+      - "EMQX_ALLOW_ANONYMOUS=false"
+
+  api:
+    build: .
+    container_name: soundbox_api
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - postgres
+      - emqx
+
+  userbot:
+    build: .
+    container_name: soundbox_userbot
+    restart: always
+    command: python adapter_telegram_userbot.py
+    env_file:
+      - .env
+    volumes:
+      - ./userbot_session.session:/app/userbot_session.session
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
