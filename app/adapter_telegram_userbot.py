@@ -95,16 +95,20 @@ async def get_target_peer(event, chat_id: str):
             except Exception:
                 pass
 
+    clean_str = str(chat_id).strip()
     try:
-        raw_id = int(str(chat_id).strip())
+        raw_id = int(clean_str)
+        # បើជា Group ID អវិជ្ជមានធម្មតាដែលមិនទាន់មាន -100 ខាងមុខ បំប្លែងទៅ -100...
+        if raw_id < 0 and not str(raw_id).startswith("-100"):
+            raw_id = int(f"-100{abs(raw_id)}")
         return await client.get_input_entity(raw_id)
     except Exception:
         pass
 
     try:
-        return await client.get_entity(int(str(chat_id).strip()))
+        return await client.get_entity(int(clean_str))
     except Exception:
-        return int(str(chat_id).strip()) if str(chat_id).lstrip("-").isdigit() else chat_id
+        return int(clean_str) if clean_str.lstrip("-").isdigit() else clean_str
 
 
 async def cleanup_all_old_qrs(peer, chat_id: str, keep_msg_id: int = None):
