@@ -22,10 +22,17 @@ SESSION_NAME = os.getenv("TELEGRAM_USERBOT_SESSION", "userbot_session")
 
 FASTAPI_USERBOT_URL = os.getenv("FASTAPI_USERBOT_URL") or "http://fastapi-gateway:8000/webhook/telegram-userbot"
 FASTAPI_SYNC_USER_URL = os.getenv("FASTAPI_SYNC_USER_URL") or "http://fastapi-gateway:8000/api/users/sync"
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "your-api-key")
+
+# Common Headers សម្រាប់ផ្ញើទៅ FastAPI Gateway
+AUTH_HEADERS = {
+    "X-API-Key": API_SECRET_KEY,
+    "Content-Type": "application/json"
+}
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Local persistence file to ensure state survives server restarts
+# Local persistence file
 STATE_FILE = os.getenv("USERBOT_STATE_FILE", "userbot_state.json")
 
 welcome_throttle = {}
@@ -37,7 +44,7 @@ last_qr_messages = {}
 
 def load_state():
     global greeted_chats, last_qr_messages
-    if os.path.exists(STATE_FILE):
+    if os.path.exists(STATE_FILE) and os.path.isfile(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
@@ -59,7 +66,6 @@ def save_state():
         logger.debug(f"Failed to save state file: {e}")
 
 
-# Load persistent state on startup
 load_state()
 
 
@@ -67,12 +73,10 @@ def can_send_welcome(chat_id: str, is_user_command: bool = False) -> bool:
     now = time.time()
     clean_id = str(chat_id).strip()
 
-    # Expire old throttles
     expired = [k for k, v in welcome_throttle.items() if now - v > THROTTLE_SECONDS]
     for k in expired:
         del welcome_throttle[k]
 
-    # If already sent within 30 seconds and not an explicit user command (/id, /qr), block duplicate
     if not is_user_command and clean_id in welcome_throttle:
         return False
 
@@ -81,13 +85,11 @@ def can_send_welcome(chat_id: str, is_user_command: bool = False) -> bool:
 
 
 async def cleanup_all_old_qrs(chat_id: str, keep_msg_id: int = None):
-    """Scan and delete all previous QR code messages in this group, keeping strictly 1 QR code"""
     clean_chat_id = str(chat_id).strip()
     try:
         target_peer = int(clean_chat_id) if clean_chat_id.lstrip("-").isdigit() else clean_chat_id
         me = await client.get_me()
 
-        # Delete from last_qr_messages tracking
         old_tracked = last_qr_messages.get(clean_chat_id)
         if old_tracked and old_tracked != keep_msg_id:
             try:
@@ -96,7 +98,6 @@ async def cleanup_all_old_qrs(chat_id: str, keep_msg_id: int = None):
             except Exception:
                 pass
 
-        # Scan recent messages sent by userbot to delete any older QR codes
         delete_ids = []
         async for msg in client.iter_messages(target_peer, limit=30, from_user=me.id):
             if keep_msg_id and msg.id == keep_msg_id:
@@ -114,7 +115,6 @@ async def cleanup_all_old_qrs(chat_id: str, keep_msg_id: int = None):
 
 
 async def send_welcome_qr(event, chat_id: str, is_user_command: bool = False):
-    """Generate in-memory QR code containing Chat ID and send to the Telegram chat/group"""
     clean_chat_id = str(chat_id).strip()
     if not can_send_welcome(clean_chat_id, is_user_command=is_user_command):
         return
@@ -143,7 +143,6 @@ async def send_welcome_qr(event, chat_id: str, is_user_command: bool = False):
         img_byte_arr.name = "soundbox_setup_qr.png"
 
         sent_msg = None
-        # Reply directly via event or resolved entity
         if event and hasattr(event, "respond"):
             sent_msg = await event.respond(caption, file=img_byte_arr, parse_mode="md")
         else:
@@ -159,10 +158,8 @@ async def send_welcome_qr(event, chat_id: str, is_user_command: bool = False):
         if new_msg_id:
             last_qr_messages[clean_chat_id] = new_msg_id
             save_state()
-            # Clean up all older QR codes so strictly ONE QR code is preserved
             await cleanup_all_old_qrs(clean_chat_id, keep_msg_id=new_msg_id)
 
-        # Delete user's /id or /qr command message to keep group chat clean
         if is_user_command and event and hasattr(event, "message") and getattr(event.message, "id", None):
             try:
                 await event.message.delete()
@@ -180,7 +177,6 @@ async def send_welcome_qr(event, chat_id: str, is_user_command: bool = False):
 
 
 async def send_welcome_qr_to_dialog(dialog, chat_id: str):
-    """Proactively send Welcome QR directly to a newly detected group dialog"""
     clean_chat_id = str(chat_id).strip()
     if not can_send_welcome(clean_chat_id, is_user_command=False):
         return
@@ -208,7 +204,6 @@ async def send_welcome_qr_to_dialog(dialog, chat_id: str):
         img_byte_arr.seek(0)
         img_byte_arr.name = "soundbox_setup_qr.png"
 
-        # Send directly to the dialog entity
         sent_msg = await client.send_file(dialog.entity, file=img_byte_arr, caption=caption, parse_mode="md")
         new_msg_id = getattr(sent_msg, "id", None)
         if new_msg_id:
@@ -225,11 +220,9 @@ async def send_welcome_qr_to_dialog(dialog, chat_id: str):
 @client.on(events.NewMessage)
 async def handle_new_message(event):
     chat_id = str(event.chat_id)
-
     raw_text = (event.message.message or "").strip()
     clean_lower = raw_text.lower()
 
-    # Check if this is an explicit setup command (/id, /qr, /code, /setup, /start)
     setup_keywords = ["/id", "/qr", "/code", "/setup", "/start", "id", "qr", "code", "setup"]
     is_command = clean_lower in setup_keywords or any(clean_lower.startswith(k + " ") for k in ["/id", "/qr", "/code", "/setup", "id", "code"])
 
@@ -238,14 +231,12 @@ async def handle_new_message(event):
         await send_welcome_qr(event, chat_id, is_user_command=True)
         return
 
-    # Check for service action messages (e.g. member joined, added to group, group created)
     action = getattr(event.message, "action", None)
     if action is not None:
         logger.info(f"Detected service action in Chat {chat_id}: {action.__class__.__name__}. Sending Welcome QR...")
         await send_welcome_qr(event, chat_id, is_user_command=False)
         return
 
-    # If this group has never been greeted, auto-send it on first message
     if chat_id not in greeted_chats:
         logger.info(f"First message in un-greeted group {chat_id}. Auto-sending Welcome QR...")
         await send_welcome_qr(event, chat_id, is_user_command=False)
@@ -253,7 +244,6 @@ async def handle_new_message(event):
     if not raw_text:
         return
 
-    # Extract sender metadata
     sender = await event.get_sender()
     sender_id = str(sender.id) if sender else None
     username = getattr(sender, "username", None)
@@ -262,19 +252,24 @@ async def handle_new_message(event):
     full_name = f"{first_name or ''} {last_name or ''}".strip()
     is_bot = getattr(sender, "bot", False)
 
+    forward_from_chat_id = None
+    if event.message.forward and event.message.forward.chat:
+        forward_from_chat_id = str(event.message.forward.chat.id)
+
     payload = {
         "chat_id": chat_id,
         "text": raw_text,
         "user_id": sender_id,
         "username": username,
         "full_name": full_name,
-        "is_bot": is_bot
+        "is_bot": is_bot,
+        "forward_from_chat_id": forward_from_chat_id
     }
 
-    # Forward the message payload to FastAPI
+    # Forward to FastAPI ជាមួយ X-API-Key Header
     async with httpx.AsyncClient(timeout=12.0) as http_client:
         try:
-            res = await http_client.post(FASTAPI_USERBOT_URL, json=payload)
+            res = await http_client.post(FASTAPI_USERBOT_URL, json=payload, headers=AUTH_HEADERS)
             if res.status_code == 200:
                 logger.info(f"Forwarded message to FastAPI [Chat: {chat_id} | Status: 200]")
             else:
@@ -283,14 +278,13 @@ async def handle_new_message(event):
             logger.error(f"Failed to forward message to FastAPI: {e}")
 
 
-# ២. Handle Chat Action Events (When UserBot joins or is added)
+# ២. Handle Chat Action Events
 @client.on(events.ChatAction)
 async def handle_chat_action(event):
     chat_id = str(event.chat_id)
     logger.info(f"ChatAction triggered in Chat {chat_id} (joined/added/created). Sending Welcome QR...")
     await send_welcome_qr(event, chat_id, is_user_command=False)
 
-    # Sync new users to database
     try:
         users = await event.get_users()
         async with httpx.AsyncClient(timeout=10.0) as http_client:
@@ -301,12 +295,12 @@ async def handle_chat_action(event):
                     "username": user.username,
                     "full_name": f"{user.first_name or ''} {user.last_name or ''}".strip()
                 }
-                await http_client.post(FASTAPI_SYNC_USER_URL, json=user_payload)
+                await http_client.post(FASTAPI_SYNC_USER_URL, json=user_payload, headers=AUTH_HEADERS)
     except Exception as e:
         logger.warning(f"User sync error on ChatAction: {e}")
 
 
-# ៣. Raw Updates Listener (Guarantees catching Supergroup & Channel joins/invites)
+# ៣. Raw Updates Listener
 @client.on(events.Raw)
 async def handle_raw_update(update):
     try:
@@ -335,7 +329,7 @@ async def handle_raw_update(update):
         logger.debug(f"Raw update handling: {e}")
 
 
-# ៤. Periodic Dialog Scanner (Auto-sends to newly joined groups only)
+# ៤. Periodic Dialog Scanner
 async def auto_scan_new_groups_loop():
     await asyncio.sleep(1.0)
     try:
@@ -377,9 +371,7 @@ async def main():
     logger.info("Listening for group joins and incoming bank transactions...")
     logger.info("==================================================")
     
-    # Run the instant new group detector in the background
     asyncio.create_task(auto_scan_new_groups_loop())
-    
     await client.run_until_disconnected()
 
 
