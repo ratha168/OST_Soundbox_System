@@ -3,51 +3,63 @@ version: '3.8'
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: soundbox_postgres
-    restart: always
+    container_name: iot_postgres
     environment:
-      POSTGRES_DB: iot_soundbox
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: StrongPasswordHere2026
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: postgres
     ports:
-      - "127.0.0.1:5432:5432"
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./PostgreSQL.sql:/docker-entrypoint-initdb.d/init.sql
-
-  emqx:
-    image: emqx/emqx:5.3.0
-    container_name: soundbox_emqx
     restart: always
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: iot_mosquitto
     ports:
       - "1883:1883"
-      - "18083:18083"
-    environment:
-      - "EMQX_ALLOW_ANONYMOUS=false"
-
-  api:
-    build: .
-    container_name: soundbox_api
+      - "9001:9001"
+    volumes:
+      - /var/www/mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - /var/www/mosquitto/data:/mosquitto/data
+      - /var/www/mosquitto/log:/mosquitto/log
     restart: always
-    env_file:
-      - .env
+
+  fastapi-gateway:
+    build:
+      context: .  # ស្ថិតក្នុង /var/www/device/
+    container_name: iot_fastapi_gateway
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
-      - "127.0.0.1:8000:8000"
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:123456@postgres:5432/postgres
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      - TELEGRAM_BOT_TOKEN=8974351475:AAHTzxM7U_XvvUuwzhcFUdtDnpbuAyzcFcQ
+      - API_SECRET_KEY=your-api-key
     depends_on:
       - postgres
-      - emqx
+      - mosquitto
+    restart: always
 
   userbot:
-    build: .
-    container_name: soundbox_userbot
-    restart: always
-    command: python adapter_telegram_userbot.py
-    env_file:
-      - .env
+    build:
+      context: .  # ស្ថិតក្នុង /var/www/device/
+    container_name: iot_telegram_userbot
+    command: python userbot.py
     volumes:
-      - ./userbot_session.session:/app/userbot_session.session
+      - .:/app
+      - ./bank_userbot.session:/app/bank_userbot.session
+    environment:
+      - TELEGRAM_API_ID=34687255
+      - TELEGRAM_API_HASH=0c8a94e104d60fe54bf05605122ae878
+      - FASTAPI_USERBOT_URL=http://fastapi-gateway:8000/webhook/telegram-userbot
+      - API_SECRET_KEY=your-api-key
     depends_on:
-      - api
+      - fastapi-gateway
+    restart: always
 
 volumes:
   pgdata:
