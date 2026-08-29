@@ -26,6 +26,8 @@ DB_PASS = os.getenv("POSTGRES_PASSWORD", "fDdiFw_KB2930otN")
 
 MQTT_BROKER = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
+MQTT_USER = os.getenv("MQTT_USER", "gateway_user")
+MQTT_PASS = os.getenv("MQTT_PASSWORD", "GatewaySecurePass$@123")
 
 def get_db():
     return psycopg2.connect(
@@ -39,6 +41,7 @@ def get_db():
 def publish_mqtt(topic: str, payload: dict):
     client = mqtt.Client()
     try:
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
         client.publish(topic, json.dumps(payload))
         client.disconnect()
@@ -69,7 +72,6 @@ async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str
     logger.info(f">>> [INCOMING REQUEST] Chat: {chat_id} | Message: {raw_text}")
     logger.info("=" * 60)
 
-    # 1. Parse Transaction
     parsed = parse_bank_message(raw_text)
     if not parsed:
         logger.warning(f"--- [PARSE FAILED] Non-bank message: '{raw_text}'")
@@ -77,7 +79,6 @@ async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str
 
     logger.info(f"+++ [PARSE SUCCESS] Result: {parsed}")
 
-    # 2. Database Lookup & Insert
     conn = None
     cursor = None
     try:
@@ -104,7 +105,6 @@ async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str
 
         bank_tx_id = str(parsed.get("transaction_id")) if parsed.get("transaction_id") else None
 
-        # Handle Duplicate Transaction gracefully with ON CONFLICT
         if bank_tx_id:
             cursor.execute(
                 """
@@ -128,6 +128,7 @@ async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str
                 """
                 INSERT INTO transactions (bank_name, bank_tx_id, amount, currency, device_sn, status, raw_payload)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (bank_name, bank_tx_id) DO NOTHING
                 RETURNING id, created_at;
                 """,
                 (
@@ -144,7 +145,6 @@ async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str
         tx_row = cursor.fetchone()
         conn.commit()
 
-        # ប្រសិនបើជា Transaction ស្ទួន (tx_row = None) មិនបាច់បាញ់សំឡេងដដែលៗទេ
         if not tx_row:
             logger.warning(f"--- [DUPLICATE TRANSACTION] Bank Tx ID {bank_tx_id} already exists in DB. Skipped.")
             return {"status": "ignored", "reason": "Transaction already processed"}
@@ -152,7 +152,6 @@ async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str
         tx_id = tx_row['id']
         logger.info(f"+++ [DB SAVED] Transaction ID: {tx_id} at {tx_row['created_at']}")
 
-        # 3. Publish MQTT to Soundbox
         mqtt_topic = f"soundbox/{device_sn}/voice"
         voice_payload = {
             "amount": str(parsed["amount"]),
