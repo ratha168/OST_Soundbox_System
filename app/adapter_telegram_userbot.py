@@ -287,6 +287,7 @@ async def handle_chat_action(event):
 
     try:
         users = await event.get_users()
+        headers = {"x-api-key": API_SECRET_KEY}
         async with httpx.AsyncClient(timeout=10.0) as http_client:
             for user in users:
                 user_payload = {
