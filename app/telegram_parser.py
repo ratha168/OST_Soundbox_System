@@ -1,112 +1,65 @@
 import re
-import logging
-from typing import Optional, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional
 
-logger = logging.getLogger("BankNotificationParser")
+def clean_amount(val_str: str) -> float:
+    cleaned = re.sub(r'[^\d.]', '', val_str)
+    return float(cleaned) if cleaned else 0.0
 
-class ParsedTransaction(BaseModel):
-    bank: str = Field(..., description="Identified bank or payment platform name")
-    txid: str = Field(..., description="Unique transaction ID or reference number")
-    amount: float = Field(..., description="Normalized numerical transaction amount")
-    currency: str = Field(..., description="Currency code (KHR or USD)")
-    payer: str = Field(..., description="Name of the sender/payer")
-
-class AdvancedBankNotificationParser:
-    """
-    Advanced production-ready parser for parsing Cambodian banking notification 
-    messages (ABA, ACLEDA, Canadia, KHQR) with built-in data normalization and logging.
-    """
-
-    @classmethod
-    def parse_message(cls, text: str) -> Optional[Dict[str, Any]]:
-        if not text or not isinstance(text, str):
-            logger.warning("Received empty or non-string text for parsing.")
-            return None
-
-        clean_text = text.strip()
-
-        # 1. CMC / Canadia KHQR Merchant Pattern
-        cmc_pattern = (
-            r"(?P<currency>KHR|USD)\s+(?P<amount>[\d,]+(?:\.\d{2})?)\s+"
-            r"is\s+paid\s+by\s+.*?\s+"
-            r"for\s+purchase\s+(?P<txid>[a-fA-F0-9]+),\s*"
-            r"from\s+(?P<payer>.+?),\s*"
-            r"at\s+"
-        )
-        match = re.search(cmc_pattern, clean_text, re.IGNORECASE)
-        if match:
-            return cls._build_result("CMC_KHQR", match)
-
-        # 2. ACLEDA / Wing Khmer Pattern
-        acleda_kh_pattern = (
-            r"បានទទួល\s+(?P<amount>[\d,]+(?:\.\d{2})?)\s+(?P<currency>រៀល|ដុល្លារ|\$|USD|KHR)\s+"
-            r"ពី\s+(?P<payer>.+?),\s*"
-            r"ថ្ងៃទី.+?,\s*"
-            r"លេខយោង\s+(?P<txid>\d+)"
-        )
-        match = re.search(acleda_kh_pattern, clean_text, re.IGNORECASE)
-        if match:
-            raw_curr = match.group("currency")
-            currency = "KHR" if raw_curr in ["រៀល", "KHR"] else "USD"
-            return cls._build_result("ACLEDA", match, override_currency=currency)
-
-        # 3. ABA KHQR Pattern
-        aba_khqr_pattern = (
-            r"(?P<currency>៛|\$)?\s*(?P<amount>[\d,]+(?:\.\d{2})?)\s+"
-            r"paid\s+by\s+(?P<payer>.+?)(?:\s*\(\*\d+\)\s*)?"
-            r"on\s+.*?"
-            r"Trx\.\s*ID:\s*(?P<txid>\d+)"
-        )
-        match = re.search(aba_khqr_pattern, clean_text, re.IGNORECASE)
-        if match:
-            raw_currency = match.group("currency")
-            currency = "KHR" if raw_currency == "៛" else "USD"
-            return cls._build_result("ABA_KHQR", match, override_currency=currency)
-
-        # 4. ABA Standard Pattern
-        aba_pattern = r"Received\s+\$(?P<amount>[\d,]+(?:\.\d{2})?)\s+from\s+(?P<payer>.+?)\s*\(Trx ID:\s*(?P<txid>\d+)\)"
-        match = re.search(aba_pattern, clean_text, re.IGNORECASE)
-        if match:
-            return cls._build_result("ABA", match, override_currency="USD")
-
-        # 5. ACLEDA English Pattern
-        acleda_en_pattern = r"Received\s+(?P<amount>[\d,]+(?:\.\d{2})?)\s+(?P<currency>KHR|USD)\s+from\s+(?P<payer>.+?)\s*\(Ref:\s*(?P<txid>\w+)\)"
-        match = re.search(acleda_en_pattern, clean_text, re.IGNORECASE)
-        if match:
-            return cls._build_result("ACLEDA", match)
-
-        logger.debug(f"No matching bank notification pattern found for text: {clean_text[:50]}...")
+def parse_bank_message(text: str) -> Optional[Dict[str, Any]]:
+    if not text or not isinstance(text, str):
         return None
+    
+    clean_text = text.strip()[:1000]
 
-    @staticmethod
-    def _build_result(bank_name: str, match_obj: re.Match, override_currency: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        try:
-            groups = match_obj.groupdict()
-            amount_str = groups["amount"].replace(",", "")
-            amount = float(amount_str)
-            
-            currency = override_currency
-            if not currency and "currency" in groups and groups["currency"]:
-                raw_curr = groups["currency"].upper()
-                currency = "KHR" if raw_curr in ["KHR", "៛"] else "USD"
-            elif not currency:
-                currency = "USD"
-
-            payer = re.sub(r'\s*\(\*\d+\)\s*$', '', groups["payer"]).strip()
-
-            data = {
-                "bank": bank_name,
-                "txid": groups["txid"].strip(),
-                "amount": amount,
-                "currency": currency,
-                "payer": payer
-            }
-
-            # Validate via Pydantic schema model
-            validated = ParsedTransaction(**data)
-            return validated.dict()
-        
-        except (ValueError, TypeError, KeyError) as e:
-            logger.error(f"Error parsing match groups for {bank_name}: {e}")
+    # Pattern 1: $200,000 paid by SOK SOPHEAP (*936) on Aug 29, 08:32 PM via ABA PAY at SOKUNTHEA by S.OENG. Trx. ID: 178801033064695, APV: 373304.
+    p1 = re.search(
+        r'([\$៛]?)\s*([\d,]+(?:\.\d{1,2})?)\s*(USD|KHR|ដុល្លារ|រៀល)?\s+paid\s+by\s+(.*?)\s+on\s+(.*?)\s+via\s+(.*?)(?:\s+at\s+.*?)?(?:\.\s*Trx\.\s*ID:\s*([A-Za-z0-9]+))?',
+        clean_text,
+        re.IGNORECASE
+    )
+    if p1:
+        cur_sym, amount_str, cur_text, payer, _, via_bank, trx_id = p1.groups()
+        amount = clean_amount(amount_str)
+        if amount <= 0:
             return None
+
+        currency = "USD"
+        if cur_sym == "៛" or (cur_text and cur_text.upper() in ["KHR", "រៀល"]):
+            currency = "KHR"
+        elif cur_sym == "$" or (cur_text and cur_text.upper() in ["USD", "ដុល្លារ"]):
+            currency = "USD"
+        elif amount > 500:
+            currency = "KHR"
+
+        bank = "ABA" if "ABA" in (via_bank or clean_text).upper() else "Bakong"
+        
+        # Backup trx_id check if regex group didn't catch it
+        if not trx_id:
+            trx_m = re.search(r'Trx\.\s*ID:\s*([A-Za-z0-9]+)', clean_text, re.IGNORECASE)
+            trx_id = trx_m.group(1) if trx_m else None
+
+        return {
+            "amount": amount,
+            "currency": currency,
+            "bank": bank,
+            "payer": (payer or "Customer").strip()[:100],
+            "transaction_id": trx_id,
+            "raw_text": clean_text
+        }
+
+    # Pattern 2: Fallback Pattern
+    p2 = re.search(r'([\d,]+(?:\.\d{1,2})?)\s*(USD|KHR|\$|៛)', clean_text, re.IGNORECASE)
+    if p2:
+        amount = clean_amount(p2.group(1))
+        cur_text = p2.group(2).upper()
+        currency = "KHR" if cur_text in ["KHR", "៛"] or amount > 500 else "USD"
+        return {
+            "amount": amount,
+            "currency": currency,
+            "bank": "ABA" if "ABA" in clean_text.upper() else "Bakong",
+            "payer": "Customer",
+            "transaction_id": None,
+            "raw_text": clean_text
+        }
+
+    return None
