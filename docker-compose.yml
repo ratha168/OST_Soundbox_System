@@ -4,7 +4,7 @@ services:
     container_name: iot_postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: 123456
+      POSTGRES_PASSWORD: fDdiFw_KB2930otN
       POSTGRES_DB: postgres
     ports:
       - "5432:5432"
@@ -32,7 +32,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:123456@postgres:5432/postgres
+      - DATABASE_URL=postgresql://postgres:fDdiFw_KB2930otN@postgres:5432/postgres
       - MQTT_BROKER=mosquitto
       - MQTT_PORT=1883
       - TELEGRAM_BOT_TOKEN=8974351475:AAHTzxM7U_XvvUuwzhcFUdtDnpbuAyzcFcQ
