@@ -21,7 +21,7 @@ class SoundboxMQTTPublisher:
         self.password = password
         self.on_ack_received = on_ack_received
         
-        self.client = mqtt.Client(client_id=f"fastapi_soundbox_{int(time.time())}")
+        self.client = mqtt.Client(client_id=f"fastapi_gw_{int(time.time())}")
         if self.username and self.password:
             self.client.username_pw_set(self.username, self.password)
 
@@ -33,10 +33,9 @@ class SoundboxMQTTPublisher:
         if rc == 0:
             self._is_connected = True
             logger.info("Connected to MQTT Broker successfully.")
-            # Subscribe ទៅកាន់ Topic Response របស់ Device ទាំងអស់
-            client.subscribe("+/pubmsg", qos=1)
-            client.subscribe("/+/pubmsg", qos=1)
-            logger.info("Subscribed to device ACK topics: +/pubmsg, /+/pubmsg")
+            # Subscribe ទៅកាន់ Topic Device Response
+            client.subscribe("#", qos=1)
+            logger.info("Subscribed to MQTT Topic [#] successfully.")
         else:
             self._is_connected = False
             logger.error(f"Failed to connect to MQTT Broker, return code: {rc}")
@@ -46,12 +45,10 @@ class SoundboxMQTTPublisher:
             topic = msg.topic
             payload_raw = msg.payload.decode("utf-8")
             data = json.loads(payload_raw)
-            logger.info(f"MQTT Message Received on [{topic}]: {data}")
-
             if self.on_ack_received:
                 self.on_ack_received(topic, data)
         except Exception as e:
-            logger.error(f"Error handling incoming MQTT message on {msg.topic}: {e}")
+            pass
 
     def connect(self):
         try:
