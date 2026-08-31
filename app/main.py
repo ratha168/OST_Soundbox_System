@@ -411,7 +411,6 @@ async def health():
 
 # @app.post("/webhook/telegram-bot", status_code=status.HTTP_200_OK)
 
-
 @app.post("/webhook/telegram-userbot", status_code=status.HTTP_200_OK)
 async def unified_telegram_webhook(request: Request):
     try:
@@ -437,3 +436,95 @@ async def unified_telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook Exception: {e}\n{traceback.format_exc()}")
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# ==============================================================================
+# FUNCTION: ទាញទិន្នន័យពី Postgres រួចបាញ់ Set Static KHQR ទៅ Soundbox
+# ==============================================================================
+async def sync_device_static_khqr_from_db(device_sn: str) -> Dict[str, Any]:
+    if not db_pool:
+        return {"success": False, "error": "Database pool not ready"}
+    if not mqtt_pub:
+        return {"success": False, "error": "MQTT Publisher not ready"}
+
+    async with db_pool.acquire() as conn:
+        # ១. ទាញទិន្នន័យ KHQR និង merchant_id ពី PostgreSQL
+        device = await conn.fetchrow(
+            """
+            SELECT device_id, device_name, khqr_data, shop_name, merchant_id 
+            FROM devices 
+            WHERE device_id = $1 AND is_active = TRUE
+            """,
+            device_sn
+        )
+
+        if not device:
+            return {"success": False, "error": f"Device SN {device_sn} not found or inactive"}
+
+        khqr_string = device["khqr_data"]
+        if not khqr_string:
+            return {"success": False, "error": f"No khqr_data found in DB for Device SN {device_sn}"}
+
+        shop_name = device["shop_name"] or device["device_name"] or "Scan to Pay"
+        merchant_display_id = f"ID: {device['merchant_id']}" if device["merchant_id"] else f"ID: {device_sn}"
+
+        # ២. បង្កើត MQTT Payload តាម Vendor Protocol (set_device_info)
+        topic = f"/LLZN/{device_sn}"
+        unique_msg_id = str(int(time.time() * 1000))[-10:]
+
+        payload = {
+            "message_id": unique_msg_id,
+            "time_stamp": str(int(time.time())),
+            "device_sn": str(device_sn),
+            "packet_type": "set_device_info",
+            "content": {
+                "screen_content_config": {
+                    "main_screen_label_1_config": {
+                        "txt": "Scan to Pay",
+                        "hei": 24,
+                        "col": "000000"
+                    },
+                    "main_screen_qrcode_1_config": {
+                        "txt": str(khqr_string).strip(),
+                        "hei": 210,
+                        "col": "000000"
+                    },
+                    "main_screen_label_3_config": {
+                        "txt": str(shop_name),
+                        "hei": 24,
+                        "col": "000000"
+                    },
+                    "main_screen_label_4_config": {
+                        "txt": str(merchant_display_id),
+                        "hei": 16,
+                        "col": "0000FF"
+                    }
+                }
+            }
+        }
+
+        # ៣. Publish ទៅកាន់ HEMI Screen Device
+        res = await mqtt_pub.publish_voice_payload(topic=topic, payload=payload, qos=1)
+        if res.get("success"):
+            logger.info(f"✅ [KHQR SYNCED] Successfully pushed Static KHQR to screen for SN: {device_sn}")
+            return {"success": True, "device_sn": device_sn, "shop_name": shop_name, "merchant_id": device["merchant_id"], "latency_ms": res.get("latency_ms")}
+        else:
+            logger.error(f"❌ [KHQR SYNC FAILED] MQTT error: {res.get('error')}")
+            return {"success": False, "error": res.get("error")}
+
+
+# ==============================================================================
+# ROUTER: API Trigger Push Static KHQR ពី Postgres
+# ==============================================================================
+@app.post("/api/devices/{device_sn}/push-static-khqr", status_code=status.HTTP_200_OK)
+async def api_push_static_khqr(
+    device_sn: str,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    if x_api_key != settings.api_secret_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+
+    result = await sync_device_static_khqr_from_db(device_sn)
+    if not result.get("success"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.get("error"))
+
+    return {"status": "success", "data": result}
