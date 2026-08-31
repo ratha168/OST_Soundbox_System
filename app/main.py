@@ -186,26 +186,41 @@ async def process_device_packet_direct(topic: str, data: dict):
                 logger.info(f"✅ DB SAVED SUCCESSFULLY [SN: {device_sn}] -> Battery: {battery_str}, Signal: {signal_str}")
 
             # ២. Payment ACK (ចាប់យកគ្រប់ Response ក្រោយពេលចាក់សំឡេង)
-            else:
+           else:
                 resp_status = content.get("response_status") or content.get("play_status") or content.get("status") or "success"
                 is_success = str(resp_status).lower() in ["success", "ok", "0", "true", "play_end", "finish"]
 
-                await conn.execute(
+                # វិធីទី ១: Update តាម txid/msg_id ប្រសិនបើមាន
+                result = await conn.execute(
                     """
                     UPDATE transactions 
                     SET device_ack = $1,
                         ack_status = $2,
                         ack_at = CURRENT_TIMESTAMP
-                    WHERE ctid = (
-                        SELECT ctid FROM transactions 
-                        WHERE device_id = $3 
-                        ORDER BY created_at DESC 
-                        LIMIT 1
-                    )
+                    WHERE device_id = $3 AND (txid = $4 OR raw_payload LIKE '%' || $4 || '%')
                     """,
-                    is_success, str(resp_status), device_sn
+                    is_success, str(resp_status), device_sn, msg_id
                 )
-                logger.info(f"✅ Transaction ACK Updated via ctid [SN: {device_sn}] | Status: {resp_status}")
+
+                # វិធីទី ២: ប្រសិនបើមិនត្រូវតាម msg_id ទេ គឺ Update លើ Transaction ចុងក្រោយបំផុតរបស់ Device នោះ
+                if result == "UPDATE 0":
+                    await conn.execute(
+                        """
+                        UPDATE transactions 
+                        SET device_ack = $1,
+                            ack_status = $2,
+                            ack_at = CURRENT_TIMESTAMP
+                        WHERE id = (
+                            SELECT id FROM transactions 
+                            WHERE device_id = $3 
+                            ORDER BY id DESC 
+                            LIMIT 1
+                        )
+                        """,
+                        is_success, str(resp_status), device_sn
+                    )
+
+                logger.info(f"✅ DB ACK FORCED UPDATE [SN: {device_sn}] | Status: {resp_status}")
 
     except Exception as e:
         logger.error(f"Error executing DB update from MQTT packet: {e}\n{traceback.format_exc()}")
@@ -624,7 +639,7 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
                         sent_devices.append(sn)
                         logger.info(f"HEMI payment broadcast sent to device SN {sn} on {topic} (Latency: {res.get('latency_ms')}ms)")
 
-                        # កត់ត្រា ACK = True ភ្លាមៗនៅពេល MQTT បញ្ជូនទៅដល់ Soundbox ដោយជោគជ័យ
+                        # កត់ត្រា ACK = TRUE តាម txid ភ្លាមៗ
                         await conn.execute(
                             """
                             UPDATE transactions 
