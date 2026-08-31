@@ -1,186 +1,784 @@
+import io
 import json
 import logging
 import os
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel
-import psycopg2
-from psycopg2.extras import RealDictCursor, Json
-import paho.mqtt.client as mqtt
+import time
+import traceback
+from contextlib import asynccontextmanager
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional
 
-from app.telegram_parser import parse_bank_message
+import asyncpg
+import httpx
+import qrcode
+from dotenv import load_dotenv
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+from starlette.middleware.base import BaseHTTPMiddleware
 
+# ==============================================================================
+# SUBFOLDER / MODULE IMPORTS
+# ==============================================================================
+from app.Telegram.telegram_parser import BankNotificationParser, Transaction, parse_bank_message
+from app.Mqtt.mqtt_publisher import SoundboxMQTTPublisher
+from app.Redis.dedup import is_duplicate_transaction
+
+load_dotenv()
+
+# ==============================================================================
+# 1. APPLICATION SETTINGS & CONFIGURATION
+# ==============================================================================
+class Settings(BaseSettings):
+    database_url: str = os.getenv("DATABASE_URL", "postgresql://postgres:fDdiFw_KB2930otN@postgres:5432/postgres")
+    mqtt_broker: str = os.getenv("MQTT_HOST", "mosquitto")
+    mqtt_port: int = int(os.getenv("MQTT_PORT", 1883))
+    mqtt_user: Optional[str] = os.getenv("MQTT_USER", None)
+    mqtt_password: Optional[str] = os.getenv("MQTT_PASSWORD", None)
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    api_secret_key: str = os.getenv("API_SECRET_KEY", "your-api-key")
+    cache_ttl: float = 15.0
+    http_timeout_seconds: float = 10.0
+    app_env: str = "production"
+
+    @property
+    def telegram_api_url(self) -> str:
+        return f"https://api.telegram.org/bot{self.telegram_bot_token}"
+
+    @property
+    def bot_id_prefix(self) -> str:
+        return self.telegram_bot_token.split(":")[0] if ":" in self.telegram_bot_token else ""
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
+
+
+settings = Settings()
+
+# ==============================================================================
+# 2. LOGGING CONFIGURATION
+# ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s"
 )
-logger = logging.getLogger("IoT_FastAPI")
+logger = logging.getLogger("ost_soundbox_gateway")
 
-app = FastAPI(title="IoT Soundbox Gateway")
+# ==============================================================================
+# 3. GLOBAL RESOURCES & LIFESPAN MANAGEMENT
+# ==============================================================================
+db_pool: Optional[asyncpg.Pool] = None
+mqtt_pub: Optional[SoundboxMQTTPublisher] = None
+http_client: Optional[httpx.AsyncClient] = None
+welcome_cache: Dict[str, float] = {}
 
-DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
-DB_PORT = os.getenv("POSTGRES_PORT", "5432")
-DB_NAME = os.getenv("POSTGRES_DB", "postgres")
-DB_USER = os.getenv("POSTGRES_USER", "postgres")
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "fDdiFw_KB2930otN")
 
-MQTT_BROKER = os.getenv("MQTT_HOST", "mosquitto")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
-MQTT_USER = os.getenv("MQTT_USER", "gateway_user")
-MQTT_PASS = os.getenv("MQTT_PASSWORD", "GatewaySecurePass$@123")
+class SenderType(str, Enum):
+    BANK_SENDER = "BANK_SENDER"
+    AUTHORIZED_ADMIN = "AUTHORIZED_ADMIN"
+    UNAUTHORIZED = "UNAUTHORIZED"
 
-def get_db():
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool, mqtt_pub, http_client
+
+    logger.info("Initializing AsyncPG PostgreSQL pool...")
+    try:
+        db_pool = await asyncpg.create_pool(
+            dsn=settings.database_url,
+            min_size=2,
+            max_size=20,
+            command_timeout=10.0
+        )
+        logger.info("PostgreSQL Database pool established successfully.")
+    except Exception as e:
+        logger.critical(f"Failed to connect to PostgreSQL: {e}\n{traceback.format_exc()}")
+
+    logger.info("Initializing persistent Async HTTP Client session pool...")
+    try:
+        http_client = httpx.AsyncClient(
+            timeout=settings.http_timeout_seconds,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize HTTP client: {e}")
+
+    logger.info(f"Connecting to MQTT Broker at {settings.mqtt_broker}:{settings.mqtt_port}...")
+    try:
+        mqtt_pub = SoundboxMQTTPublisher(
+            broker_host=settings.mqtt_broker,
+            broker_port=settings.mqtt_port,
+            username=settings.mqtt_user,
+            password=settings.mqtt_password
+        )
+        mqtt_pub.connect()
+        logger.info("MQTT Client initiated connection loop.")
+    except Exception as e:
+        logger.critical(f"MQTT connection startup error: {e}\n{traceback.format_exc()}")
+
+    yield
+
+    logger.info("Gracefully shutting down gateway services...")
+    if mqtt_pub:
+        try:
+            mqtt_pub.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting MQTT: {e}")
+    if http_client:
+        try:
+            await http_client.aclose()
+        except Exception as e:
+            logger.error(f"Error closing HTTP Client: {e}")
+    if db_pool:
+        try:
+            await db_pool.close()
+        except Exception as e:
+            logger.error(f"Error closing DB pool: {e}")
+
+
+app = FastAPI(
+    title="OST Soundbox System Gateway",
+    version="0.0.1",
+    lifespan=lifespan
+)
+
+# ==============================================================================
+# 4. FULL REQUEST / RESPONSE LOGGING MIDDLEWARE
+# ==============================================================================
+class FullLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        start_time = time.time()
+        client_ip = request.client.host if request.client else "unknown"
+        method = request.method
+        url = str(request.url)
+
+        req_body_bytes = await request.body()
+        req_body_str = ""
+        if req_body_bytes:
+            try:
+                req_body_str = req_body_bytes.decode("utf-8")
+            except Exception:
+                req_body_str = f"<binary data: {len(req_body_bytes)} bytes>"
+
+        logger.info(f">>> [INCOMING REQUEST] {method} {url} | IP: {client_ip} | Body: {req_body_str}")
+
+        try:
+            response = await call_next(request)
+            process_time = (time.time() - start_time) * 1000.0
+
+            res_body_bytes = b""
+            async for chunk in response.body_iterator:
+                res_body_bytes += chunk
+
+            res_body_str = ""
+            try:
+                res_body_str = res_body_bytes.decode("utf-8")
+            except Exception:
+                res_body_str = f"<binary response: {len(res_body_bytes)} bytes>"
+
+            logger.info(
+                f"<<< [RESPONSE] {method} {url} | Status: {response.status_code} "
+                f"| Latency: {process_time:.2f}ms | Body: {res_body_str}"
+            )
+
+            return Response(
+                content=res_body_bytes,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type
+            )
+
+        except Exception as exc:
+            process_time = (time.time() - start_time) * 1000.0
+            logger.error(
+                f"!!! [UNHANDLED EXCEPTION] {method} {url} | Latency: {process_time:.2f}ms "
+                f"| Error: {str(exc)}\n{traceback.format_exc()}"
+            )
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"status": "error", "message": "Internal Server Error", "detail": str(exc)}
+            )
+
+app.add_middleware(FullLoggingMiddleware)
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"Validation Error on {request.url}: {exc.errors()} | Body: {exc.body}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"status": "error", "message": "Validation Error", "details": exc.errors()}
     )
 
-def publish_mqtt(topic: str, payload: dict):
-    client = mqtt.Client()
-    try:
-        client.username_pw_set(MQTT_USER, MQTT_PASS)
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.publish(topic, json.dumps(payload))
-        client.disconnect()
-        logger.info(f"==> [MQTT PUBLISHED] Topic: {topic} | Payload: {json.dumps(payload)}")
-    except Exception as e:
-        logger.error(f"==> [MQTT ERROR] Failed to publish: {e}")
+# ==============================================================================
+# 5. PYDANTIC SCHEMAS
+# ==============================================================================
+class ScreenContent(BaseModel):
+    qrType: Optional[str] = "DYNAMIC"
+    color: Optional[str] = "BLACK"
+    size: Optional[int] = 200
 
-class UserbotPayload(BaseModel):
-    telegram_chat_id: Optional[str] = None
-    chat_id: Optional[str] = None
-    telegram_user_id: Optional[str] = None
-    user_id: Optional[str] = None
+
+class QRCodeDataRequest(BaseModel):
+    deviceNumber: str
+    amountDue: float
+    orderId: str
+    sessionToken: Optional[str] = ""
+    timeOut: Optional[int] = 300
+    screenContent: Optional[ScreenContent] = None
+
+
+class TelegramWebhookPayload(BaseModel):
+    message: Optional[Dict[str, Any]] = None
+    channel_post: Optional[Dict[str, Any]] = None
+    my_chat_member: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "ignore"
+
+
+class UserBotPayload(BaseModel):
+    telegram_chat_id: Optional[Any] = None
+    chat_id: Optional[Any] = None
     raw_message: Optional[str] = None
     text: Optional[str] = None
+    telegram_user_id: Optional[Any] = None
+    user_id: Optional[Any] = None
     username: Optional[str] = None
     full_name: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     is_bot: Optional[bool] = False
-    forward_from_chat_id: Optional[str] = None
+    is_verified: Optional[bool] = False
+    forward_from_chat_id: Optional[Any] = None
 
-@app.post("/webhook/telegram-userbot")
-async def telegram_userbot_webhook(data: UserbotPayload, x_api_key: Optional[str] = Header(None)):
-    chat_id = str(data.telegram_chat_id or data.chat_id or "").strip()
-    raw_text = (data.raw_message or data.text or "").strip()
+    class Config:
+        extra = "ignore"
 
-    logger.info("=" * 60)
-    logger.info(f">>> [INCOMING REQUEST] Chat: {chat_id} | Message: {raw_text}")
-    logger.info("=" * 60)
+# ==============================================================================
+# 6. BUSINESS LOGIC & SERVICES
+# ==============================================================================
+class TelegramNotificationService:
+    @staticmethod
+    def normalize_chat_id(chat_id: str | int) -> str:
+        c_str = str(chat_id).strip()
+        if c_str.startswith("-") and not c_str.startswith("-100"):
+            clean_num = c_str.lstrip("-")
+            return f"-100{clean_num}"
+        return c_str
 
-    parsed = parse_bank_message(raw_text)
-    if not parsed:
-        logger.warning(f"--- [PARSE FAILED] Non-bank message: '{raw_text}'")
-        return {"status": "ignored", "reason": "Not a bank transaction message"}
+    @staticmethod
+    def should_send_welcome(chat_id: str) -> bool:
+        try:
+            current_time = time.time()
+            clean_chat_id = TelegramNotificationService.normalize_chat_id(chat_id)
 
-    logger.info(f"+++ [PARSE SUCCESS] Result: {parsed}")
+            expired = [k for k, v in welcome_cache.items() if current_time - v > settings.cache_ttl]
+            for k in expired:
+                welcome_cache.pop(k, None)
 
-    conn = None
-    cursor = None
+            if clean_chat_id in welcome_cache:
+                logger.info(f"Duplicate welcome event suppressed for chat_id: {clean_chat_id}")
+                return False
+
+            welcome_cache[clean_chat_id] = current_time
+            return True
+        except Exception as e:
+            logger.error(f"Error in should_send_welcome check: {e}")
+            return True
+
+    @classmethod
+    async def send_welcome_qr(cls, chat_id: str):
+        clean_chat_id = cls.normalize_chat_id(chat_id)
+        if not cls.should_send_welcome(clean_chat_id):
+            return
+
+        caption = (
+            "សូមស្វាគមន៍មកកាន់ប្រព័ន្ធសំឡេង OST Soundbox System!\n"
+            "លោកអ្នកកំពុងតែរៀបចំក្នុងការដំឡើងឧបករណ៍ Soundbox របស់យើងខ្ញុំ។ សូមចម្លងលេខកូដខាងក្រោមនេះ "
+            "ដើម្បីយកទៅបំពេញ ឬតភ្ជាប់ទៅក្នុង 「Verification Code」 នៅក្នុងប្រព័ន្ធយើងខ្ញុំ\n\n"
+            "លេខកូដ (telegram code) របស់អ្នកគឺ\n"
+            "Please copy telegram code to complete the setup:\n"
+            f"`{clean_chat_id}`"
+        )
+
+        try:
+            qr = qrcode.QRCode(version=1, box_size=10, border=2)
+            qr.add_data(clean_chat_id)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format="PNG")
+            img_bytes = img_byte_arr.getvalue()
+
+            files = {"photo": ("qrcode.png", img_bytes, "image/png")}
+            data = {
+                "chat_id": clean_chat_id,
+                "caption": caption,
+                "parse_mode": "Markdown"
+            }
+
+            if http_client:
+                res = await http_client.post(
+                    f"{settings.telegram_api_url}/sendPhoto",
+                    data=data,
+                    files=files
+                )
+                if res.status_code != 200:
+                    logger.warning(f"Telegram Photo failed ({res.status_code}: {res.text}), fallback to text...")
+                    await cls.send_text_message(clean_chat_id, caption)
+                else:
+                    logger.info(f"Welcome QR successfully sent to Chat: {clean_chat_id}")
+        except Exception as e:
+            logger.error(f"Exception in send_welcome_qr: {e}\n{traceback.format_exc()}")
+            await cls.send_text_message(clean_chat_id, caption)
+
+    @classmethod
+    async def send_text_message(cls, chat_id: str, text: str):
+        if not http_client:
+            return
+        clean_chat_id = cls.normalize_chat_id(chat_id)
+        payload = {
+            "chat_id": clean_chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        try:
+            res = await http_client.post(
+                f"{settings.telegram_api_url}/sendMessage",
+                json=payload
+            )
+            logger.info(f"Telegram sendMessage status: {res.status_code} for chat: {clean_chat_id}")
+            if res.status_code != 200:
+                logger.error(f"Telegram sendMessage error detail: {res.text}")
+        except Exception as e:
+            logger.error(f"Exception in send_text_message: {e}\n{traceback.format_exc()}")
+
+
+async def authenticate_and_classify_sender(
+    db_conn: asyncpg.Connection,
+    chat_id: str,
+    payload: UserBotPayload
+) -> SenderType:
     try:
-        conn = get_db()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        sender_id = str(payload.user_id or payload.telegram_user_id or "").strip()
+        if not sender_id:
+            return SenderType.UNAUTHORIZED
 
-        cursor.execute("SELECT device_sn, merchant_id, status FROM devices WHERE telegram_chat_id = %s LIMIT 1;", (chat_id,))
-        device = cursor.fetchone()
-        
-        if not device:
-            logger.warning(f"--- [DEVICE NOT FOUND] No device linked to Chat ID: {chat_id}")
-            return {"status": "ignored", "reason": f"No device registered for chat {chat_id}", "parsed": parsed}
+        forward_sender_id = str(payload.forward_from_chat_id).strip() if payload.forward_from_chat_id is not None else None
 
-        device_sn = device["device_sn"]
-        logger.info(f"+++ [DEVICE FOUND] SN: {device_sn}")
-
-        json_data = Json({
-            "raw_text": raw_text,
-            "parsed": parsed,
-            "sender_id": data.telegram_user_id or data.user_id,
-            "username": data.username,
-            "full_name": data.full_name
-        })
-
-        bank_tx_id = str(parsed.get("transaction_id")) if parsed.get("transaction_id") else None
-
-        if bank_tx_id:
-            cursor.execute(
-                """
-                INSERT INTO transactions (bank_name, bank_tx_id, amount, currency, device_sn, status, raw_payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (bank_name, bank_tx_id) DO NOTHING
-                RETURNING id, created_at;
-                """,
-                (
-                    str(parsed.get("bank") or "ABA"),
-                    bank_tx_id,
-                    float(parsed.get("amount") or 0.0),
-                    str(parsed.get("currency") or "USD"),
-                    str(device_sn),
-                    "SUCCESS",
-                    json_data
-                )
+        # ១. ផ្ទៀងផ្ទាត់ official_bank_bots តាម bot_id
+        is_official_bank_id = await db_conn.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM official_bank_bots 
+                WHERE is_active = TRUE AND (bot_id = $1 OR ($2::text IS NOT NULL AND bot_id = $2))
             )
-        else:
-            cursor.execute(
+            """,
+            sender_id,
+            forward_sender_id
+        )
+
+        is_verified_bot = bool(payload.is_bot and payload.is_verified)
+
+        if is_official_bank_id or is_verified_bot:
+            await db_conn.execute(
                 """
-                INSERT INTO transactions (bank_name, bank_tx_id, amount, currency, device_sn, status, raw_payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (bank_name, bank_tx_id) DO NOTHING
-                RETURNING id, created_at;
+                INSERT INTO group_users (chat_id, user_id, username, first_name, last_name, full_name, is_bot, is_authorized, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, CURRENT_TIMESTAMP)
+                ON CONFLICT (chat_id, user_id) DO UPDATE
+                SET is_authorized = TRUE,
+                    username = EXCLUDED.username,
+                    full_name = EXCLUDED.full_name,
+                    updated_at = CURRENT_TIMESTAMP
                 """,
-                (
-                    str(parsed.get("bank") or "ABA"),
-                    None,
-                    float(parsed.get("amount") or 0.0),
-                    str(parsed.get("currency") or "USD"),
-                    str(device_sn),
-                    "SUCCESS",
-                    json_data
-                )
+                chat_id, sender_id, payload.username, payload.first_name, payload.last_name, payload.full_name, bool(payload.is_bot)
+            )
+            logger.info(f"Identity Verified: AUTO-ALLOWED Bank Sender ID: {sender_id} in Chat: {chat_id}")
+            return SenderType.BANK_SENDER
+
+        # ២. ពិនិត្យ Authorized User / Admin
+        user_record = await db_conn.fetchrow(
+            """
+            SELECT is_authorized 
+            FROM group_users 
+            WHERE chat_id = $1 AND user_id = $2
+            """,
+            chat_id, sender_id
+        )
+
+        if user_record and user_record["is_authorized"]:
+            return SenderType.AUTHORIZED_ADMIN
+
+        return SenderType.UNAUTHORIZED
+    except Exception as e:
+        logger.error(f"Error during sender classification: {e}\n{traceback.format_exc()}")
+        return SenderType.UNAUTHORIZED
+
+
+async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_text: str = "") -> Optional[List[str]]:
+    if not db_pool:
+        logger.error("Cannot broadcast soundbox: Database pool is None.")
+        return None
+
+    # 1. ពិនិត្យ De-duplication តាមរយៈ Redis
+    # try:
+    #     if is_duplicate_transaction(tx.txid):
+    #         logger.warning(f"DUPLICATE DETECTED (Redis): Suppressed TxID: {tx.txid}")
+    #         return None
+    # except Exception as e:
+    #     logger.error(f"Redis de-duplication check error: {e}")
+
+    try:
+        async with db_pool.acquire() as conn:
+            # 2. ទាញយក Device ដែលបាន Bind ជាមួយ Telegram Chat ID
+            devices = await conn.fetch(
+                "SELECT device_id, device_name FROM devices WHERE chat_id = $1 AND is_active = TRUE",
+                str(chat_id).strip()
             )
 
-        tx_row = cursor.fetchone()
-        conn.commit()
+            if not devices:
+                logger.warning(f"No active Soundbox device registered for Telegram Chat ID: {chat_id}")
+                return None
 
-        if not tx_row:
-            logger.warning(f"--- [DUPLICATE TRANSACTION] Bank Tx ID {bank_tx_id} already exists in DB. Skipped.")
-            return {"status": "ignored", "reason": "Transaction already processed"}
+            primary_device_id = devices[0]["device_id"]
 
-        tx_id = tx_row['id']
-        logger.info(f"+++ [DB SAVED] Transaction ID: {tx_id} at {tx_row['created_at']}")
+            # 3. កត់ត្រា Transaction ចូល PostgreSQL
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO transactions (device_id, txid, chat_id, amount, currency, raw_payload)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    primary_device_id, tx.txid, str(chat_id).strip(), tx.amount, tx.currency, raw_text
+                )
+                logger.info(f"Transaction recorded in Database successfully: TxID {tx.txid}")
+            except asyncpg.UniqueViolationError:
+                logger.warning(f"DUPLICATE DETECTED (DB Unique Key): Transaction {tx.txid} already exists.")
+                return None
 
-        mqtt_topic = f"soundbox/{device_sn}/voice"
-        voice_payload = {
-            "amount": str(parsed["amount"]),
-            "currency": str(parsed["currency"]),
-            "bank": str(parsed["bank"]),
-            "tx_id": str(tx_id)
-        }
-        publish_mqtt(mqtt_topic, voice_payload)
+            # 4. Broadcast ទៅកាន់ HEMI Screen Device តាមស្តង់ដារ Protocol V1.1
+            sent_devices = []
+            for dev in devices:
+                sn = dev["device_id"]
+                if mqtt_pub:
+                    # Topic ផ្លូវការរបស់ HEMI: /LLZN/{SN}
+                    topic = f"/LLZN/{sn}"
 
-        res = {
-            "status": "success",
-            "transaction_id": tx_id,
-            "device_sn": device_sn,
-            "data": voice_payload
-        }
-        logger.info(f"<<< [RESPONSE SUCCESS] {res}\n" + "=" * 60)
-        return res
+                    # Message ID តែមួយគត់ (Unique Message ID)
+                    unique_msg_id = str(int(time.time() * 1000))[-10:]
+
+                    # Payload តាមស្តង់ដារ HEMI V1.1
+                    payload = {
+                        "message_id": unique_msg_id,
+                        "time_stamp": str(int(time.time())),
+                        "device_sn": str(sn),
+                        "packet_type": "payment",
+                        "content": {
+                            "play_payment_amount": float(tx.amount)
+                        }
+                    }
+
+                    # Publish ទៅកាន់ MQTT Broker
+                    res = await mqtt_pub.publish_voice_payload(topic=topic, payload=payload, qos=1)
+                    
+                    if res.get("success"):
+                        sent_devices.append(sn)
+                        logger.info(f"HEMI payment broadcast sent to device SN {sn} on {topic} (Latency: {res.get('latency_ms')}ms)")
+                    else:
+                        logger.error(f"MQTT publish failed to device {sn}: {res.get('message') or res.get('error')}")
+                else:
+                    logger.error("MQTT Publisher instance is not available.")
+
+            return sent_devices
 
     except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"!!! [GATEWAY EXCEPTION] {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+        logger.error(f"Exception during broadcast soundbox flow: {e}", exc_info=True)
+        return None
+    
+# ==============================================================================
+# 7. ROUTERS & WEBHOOK HANDLERS
+# ==============================================================================
+@app.get("/health", status_code=status.HTTP_200_OK)
+@app.get("/", status_code=status.HTTP_200_OK)
+async def health_check():
+    db_status = "disconnected"
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+                db_status = "connected"
+        except Exception:
+            db_status = "error"
 
-@app.post("/api/users/sync")
-async def sync_user(request: Request):
-    return {"status": "ok"}
+    mqtt_status = "connected" if (mqtt_pub and mqtt_pub.is_connected()) else "disconnected"
+
+    return {
+        "status": "healthy" if (db_status == "connected" and mqtt_status == "connected") else "degraded",
+        "service": "OST Soundbox Gateway",
+        "database": db_status,
+        "mqtt": mqtt_status,
+        "timestamp": int(time.time())
+    }
+
+
+@app.post("/webhook/telegram-bot", status_code=status.HTTP_200_OK)
+async def telegram_webhook(payload: TelegramWebhookPayload, background_tasks: BackgroundTasks):
+    try:
+        data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+
+        if not db_pool:
+            raise HTTPException(status_code=500, detail="Database connection pool uninitialized")
+
+        async with db_pool.acquire() as conn:
+            # ==============================================================================
+            # ១. EVENT: my_chat_member (ពេល BOT ចូល GROUP ➔ ផ្ញើ QR & AUTO-SYNC ADMIN ជា FALSE)
+            # ==============================================================================
+            my_chat_member = data.get("my_chat_member")
+            if my_chat_member:
+                chat_id = str(my_chat_member.get("chat", {}).get("id", "")).strip()
+                old_status = my_chat_member.get("old_chat_member", {}).get("status")
+                new_status = my_chat_member.get("new_chat_member", {}).get("status")
+                from_user = my_chat_member.get("from", {})
+
+                if old_status in ["left", "kicked", None] and new_status in ["member", "administrator"]:
+                    background_tasks.add_task(TelegramNotificationService.send_welcome_qr, chat_id)
+
+                    if from_user:
+                        admin_id = str(from_user.get("id", "")).strip()
+                        admin_username = from_user.get("username")
+                        admin_first = from_user.get("first_name", "")
+                        admin_last = from_user.get("last_name", "")
+                        admin_name = f"{admin_first} {admin_last}".strip()
+
+                        await conn.execute(
+                            """
+                            INSERT INTO group_users (chat_id, user_id, username, first_name, last_name, full_name, is_bot, is_authorized, updated_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE, CURRENT_TIMESTAMP)
+                            ON CONFLICT (chat_id, user_id) DO UPDATE
+                            SET is_authorized = FALSE,
+                                username = EXCLUDED.username,
+                                first_name = EXCLUDED.first_name,
+                                last_name = EXCLUDED.last_name,
+                                full_name = EXCLUDED.full_name,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id, admin_id, admin_username, admin_first, admin_last, admin_name
+                        )
+                        logger.info(f"Auto-synced Group Admin ID {admin_id} to Chat {chat_id} (is_authorized=FALSE)")
+
+                    return {"status": "success", "action": "sent_welcome_qr_and_synced_admin", "chat_id": chat_id}
+                else:
+                    logger.info(f"Ignored status change from {old_status} to {new_status} for chat {chat_id}")
+                    return {"status": "ignored", "reason": f"Member status updated from {old_status} to {new_status}"}
+
+            # ==============================================================================
+            # ២. ទាញយក MESSAGE ឬ CHANNEL_POST
+            # ==============================================================================
+            message = data.get("message") or data.get("channel_post")
+            if not message:
+                return {"status": "ignored", "reason": "No valid message payload"}
+
+            chat_id = str(message.get("chat", {}).get("id", "")).strip()
+            if not chat_id:
+                return {"status": "ignored", "reason": "No chat ID found"}
+
+            from_user = message.get("from", {})
+            raw_text = str(message.get("text", "")).strip()
+
+            # ==============================================================================
+            # ៣. EVENT: new_chat_members (សមាជិកថ្មីចូល GROUP ➔ BATCH AUTO-SYNC)
+            # ==============================================================================
+            if "new_chat_members" in message:
+                new_members = message.get("new_chat_members", [])
+                bot_prefix = settings.bot_id_prefix
+                users_to_insert = []
+
+                for m in new_members:
+                    m_id = str(m.get("id", "")).strip()
+                    m_username = m.get("username")
+                    m_first = m.get("first_name", "")
+                    m_last = m.get("last_name", "")
+                    m_name = f"{m_first} {m_last}".strip()
+                    is_bot_user = bool(m.get("is_bot", False))
+
+                    if is_bot_user and m_id == bot_prefix:
+                        background_tasks.add_task(TelegramNotificationService.send_welcome_qr, chat_id)
+                    else:
+                        users_to_insert.append((chat_id, m_id, m_username, m_first, m_last, m_name, is_bot_user))
+
+                if users_to_insert:
+                    await conn.executemany(
+                        """
+                        INSERT INTO group_users (chat_id, user_id, username, first_name, last_name, full_name, is_bot, is_authorized, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, CURRENT_TIMESTAMP)
+                        ON CONFLICT (chat_id, user_id) DO NOTHING
+                        """,
+                        users_to_insert
+                    )
+                    logger.info(f"Batch auto-synced {len(users_to_insert)} new members in Chat {chat_id} (is_authorized=FALSE)")
+
+                return {"status": "success", "action": "processed_new_chat_members", "count": len(users_to_insert)}
+
+            # Auto-Sync អ្នកដែលផ្ញើសារទូទៅចូល DB (ករណីមិនទាន់មានក្នុងតារាង)
+            if from_user and not from_user.get("is_bot"):
+                sender_id = str(from_user.get("id", "")).strip()
+                s_first = from_user.get("first_name", "")
+                s_last = from_user.get("last_name", "")
+                s_name = f"{s_first} {s_last}".strip()
+
+                await conn.execute(
+                    """
+                    INSERT INTO group_users (chat_id, user_id, username, first_name, last_name, full_name, is_bot, is_authorized, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE, CURRENT_TIMESTAMP)
+                    ON CONFLICT (chat_id, user_id) DO NOTHING
+                    """,
+                    chat_id,
+                    sender_id,
+                    from_user.get("username"),
+                    s_first,
+                    s_last,
+                    s_name
+                )
+
+            # ==============================================================================
+            # ៤. EVENT: COMMANDS (/id, /chatid, /setup, /start, /pay)
+            # ==============================================================================
+            if raw_text.lower().startswith(("/id", "/chatid", "/setup", "/start", "/pay")):
+                background_tasks.add_task(TelegramNotificationService.send_welcome_qr, chat_id)
+                return {"status": "success", "action": "sent_welcome_qr_command", "chat_id": chat_id}
+
+            if not raw_text:
+                return {"status": "ignored", "reason": "No text content"}
+
+            # ==============================================================================
+            # ៥. PARSE & BROADCAST TRANSACTION ប្រាក់ចូល
+            # ==============================================================================
+            tx: Optional[Transaction] = BankNotificationParser.parse(raw_text)
+            if not tx:
+                return {"status": "ignored", "reason": "Payment pattern not matched"}
+
+            sent_devices = await broadcast_soundbox_notification(tx, chat_id, raw_text=raw_text)
+            if sent_devices is None:
+                return {"status": "ignored", "reason": "No active devices or duplicate transaction"}
+
+            return {
+                "status": "success",
+                "broadcast_to_devices": sent_devices,
+                "amount": tx.amount,
+                "currency": tx.currency,
+                "txid": tx.txid
+            }
+
+    except Exception as e:
+        logger.error(f"Error processing Telegram webhook: {e}\n{traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.post("/webhook/telegram-userbot", status_code=status.HTTP_200_OK)
+async def telegram_userbot_webhook(request: Request):
+    try:
+        payload = await request.json()
+
+        chat_id = str(payload.get("chat_id") or payload.get("telegram_chat_id") or "").strip()
+        raw_text = str(payload.get("raw_message") or payload.get("text") or "").strip()
+        user_id = str(payload.get("user_id") or payload.get("telegram_user_id") or "").strip()
+
+        if not chat_id:
+            return {"status": "ignored", "reason": "Missing chat_id/telegram_chat_id"}
+
+        if not raw_text:
+            return {"status": "ignored", "reason": "Empty message"}
+
+        if not db_pool:
+            raise HTTPException(status_code=500, detail="Database pool not ready")
+
+        userbot_obj = UserBotPayload(
+            chat_id=chat_id,
+            text=raw_text,
+            user_id=user_id,
+            username=payload.get("username"),
+            first_name=payload.get("first_name"),
+            last_name=payload.get("last_name"),
+            full_name=payload.get("full_name"),
+            is_bot=payload.get("is_bot", False),
+            is_verified=payload.get("is_verified", False),
+            forward_from_chat_id=payload.get("forward_from_chat_id")
+        )
+
+        async with db_pool.acquire() as conn:
+            # ១. ផ្ទៀងផ្ទាត់ Identity & Anti-Fraud
+            sender_type = await authenticate_and_classify_sender(conn, chat_id, userbot_obj)
+
+            # ២. Bank Sender
+            # if sender_type == SenderType.BANK_SENDER:
+            if sender_type == SenderType.BANK_SENDER or SenderType.AUTHORIZED_ADMIN: # for testing
+                tx: Optional[Transaction] = BankNotificationParser.parse(raw_text)
+                if not tx:
+                    return {"status": "ignored", "reason": "Not a recognized bank notification format"}
+
+                sent_devices = await broadcast_soundbox_notification(tx, chat_id, raw_text=raw_text)
+                if sent_devices is None:
+                    return {"status": "ignored", "reason": "Device inactive or duplicate transaction"}
+
+                return {
+                    "status": "success",
+                    "sender_role": "BANK_SENDER",
+                    "broadcast_to": sent_devices,
+                    "amount": tx.amount,
+                    "currency": tx.currency,
+                    "txid": tx.txid
+                }
+
+            # ៣. Authorized Admin
+            elif sender_type == SenderType.AUTHORIZED_ADMIN:
+                logger.info(f"Authorized Admin ID {user_id} sent message in Chat {chat_id}")
+                return {"status": "ignored", "reason": "Admin message acknowledged (no sound broadcast)"}
+
+            # ៤. Block Unauthorized Sender
+            else:
+                logger.warning(f"FRAUD PREVENTED: Blocked unauthorized sender ID {user_id} in Chat {chat_id}")
+                return {
+                    "status": "rejected",
+                    "reason": f"Anti-Fraud: Sender ID {user_id} is not authorized."
+                }
+
+    except Exception as e:
+        logger.error(f"Error handling Telegram userbot webhook: {e}\n{traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.post("/api/set_qr_code_data")
+async def set_qr_code_data(
+    data: QRCodeDataRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    try:
+        if x_api_key != settings.api_secret_key:
+            logger.warning(f"Unauthorized access attempt to /api/set_qr_code_data with key: {x_api_key}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing X-API-Key header",
+            )
+
+        return {
+            "status": "success",
+            "message": "QR Code data updated successfully",
+            "orderId": data.orderId,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating QR code data: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))

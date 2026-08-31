@@ -47,7 +47,7 @@ services:
     build:
       context: .
     container_name: iot_telegram_userbot
-    command: python -m app.adapter_telegram_userbot
+    command: python -m app.Telegram.adapter_telegram_userbot
     volumes:
       - .:/app
       - ./userbot_session.session:/app/userbot_session.session
