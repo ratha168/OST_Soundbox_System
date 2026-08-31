@@ -157,7 +157,7 @@ async def process_device_packet_direct(topic: str, data: dict):
         logger.info(f"⚡ [MQTT WORKER] Processing Topic: {topic} | SN: {device_sn} | Type: {packet_type}")
 
         async with db_pool.acquire() as conn:
-            # ១. Boot Package (device_info_on_boot)
+            # ១. Boot Package (device_info_on_boot / telemetry)
             if "device_info" in packet_type or "boot" in packet_type or "battery_percent" in content:
                 bat_pct = content.get("battery_percent")
                 battery_str = f"{bat_pct}%" if bat_pct is not None else ""
@@ -168,7 +168,6 @@ async def process_device_packet_direct(topic: str, data: dict):
                 v_4g = str(content.get("4g_fw_version") or "")
                 v_wifi = str(content.get("wifi_fw_version") or "")
 
-                # ធានាថាប្រសិនបើគ្មាន Record ក្នុង DB វានឹង INSERT ថ្មី បើមានស្រាប់ UPDATE
                 await conn.execute(
                     """
                     INSERT INTO devices (device_id, device_name, is_active, battery, signal, version_4g, version_wifi, last_online, created_at, updated_at)
@@ -186,41 +185,26 @@ async def process_device_packet_direct(topic: str, data: dict):
                 logger.info(f"✅ DB SAVED SUCCESSFULLY [SN: {device_sn}] -> Battery: {battery_str}, Signal: {signal_str}")
 
             # ២. Payment ACK (ចាប់យកគ្រប់ Response ក្រោយពេលចាក់សំឡេង)
-           else:
+            else:
                 resp_status = content.get("response_status") or content.get("play_status") or content.get("status") or "success"
                 is_success = str(resp_status).lower() in ["success", "ok", "0", "true", "play_end", "finish"]
 
-                # វិធីទី ១: Update តាម txid/msg_id ប្រសិនបើមាន
-                result = await conn.execute(
+                await conn.execute(
                     """
                     UPDATE transactions 
                     SET device_ack = $1,
                         ack_status = $2,
                         ack_at = CURRENT_TIMESTAMP
-                    WHERE device_id = $3 AND (txid = $4 OR raw_payload LIKE '%' || $4 || '%')
-                    """,
-                    is_success, str(resp_status), device_sn, msg_id
-                )
-
-                # វិធីទី ២: ប្រសិនបើមិនត្រូវតាម msg_id ទេ គឺ Update លើ Transaction ចុងក្រោយបំផុតរបស់ Device នោះ
-                if result == "UPDATE 0":
-                    await conn.execute(
-                        """
-                        UPDATE transactions 
-                        SET device_ack = $1,
-                            ack_status = $2,
-                            ack_at = CURRENT_TIMESTAMP
-                        WHERE id = (
-                            SELECT id FROM transactions 
-                            WHERE device_id = $3 
-                            ORDER BY id DESC 
-                            LIMIT 1
-                        )
-                        """,
-                        is_success, str(resp_status), device_sn
+                    WHERE ctid = (
+                        SELECT ctid FROM transactions 
+                        WHERE device_id = $3 
+                        ORDER BY created_at DESC 
+                        LIMIT 1
                     )
-
-                logger.info(f"✅ DB ACK FORCED UPDATE [SN: {device_sn}] | Status: {resp_status}")
+                    """,
+                    is_success, str(resp_status), device_sn
+                )
+                logger.info(f"✅ Transaction ACK Updated via ctid [SN: {device_sn}] | Status: {resp_status}")
 
     except Exception as e:
         logger.error(f"Error executing DB update from MQTT packet: {e}\n{traceback.format_exc()}")
@@ -299,7 +283,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="OST Soundbox System Gateway",
-    version="1.0.0",
+    version="0.0.0.1",
     lifespan=lifespan
 )
 
@@ -650,8 +634,7 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
                             """,
                             tx.txid
                         )
-                    else:
-                        logger.error(f"MQTT publish failed to device {sn}: {res.get('message') or res.get('error')}")
+                        logger.info(f"✅ Transaction ACK Auto-Saved to DB [TxID: {tx.txid}]")
                 else:
                     logger.error("MQTT Publisher instance is not available.")
 
