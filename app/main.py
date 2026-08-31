@@ -5,14 +5,18 @@ import logging
 import os
 import time
 import traceback
-from contextlib import asynccontextmanager
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
-
 import asyncpg
 import httpx
 import qrcode
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi import (
     BackgroundTasks,
     FastAPI,
@@ -22,12 +26,6 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
-from starlette.middleware.base import BaseHTTPMiddleware
-
 # ==============================================================================
 # SUBFOLDER / MODULE IMPORTS
 # ==============================================================================
@@ -266,7 +264,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="OST Soundbox System Gateway",
-    version="1.0.0",
+    version="0.0.0.1",
     lifespan=lifespan
 )
 

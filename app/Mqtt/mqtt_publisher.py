@@ -4,7 +4,8 @@ import time
 from typing import Callable, Optional
 import paho.mqtt.client as mqtt
 
-logger = logging.getLogger("soundbox_mqtt")
+logger = logging.getLogger("Soundbox_MQTT_Advanced")
+
 
 class SoundboxMQTTPublisher:
     def __init__(
@@ -21,7 +22,10 @@ class SoundboxMQTTPublisher:
         self.password = password
         self.on_ack_received = on_ack_received
         
-        self.client = mqtt.Client(client_id=f"fastapi_gw_{int(time.time())}")
+        # Unique Client ID
+        self.client_id = f"ost_soundbox_gateway_{int(time.time())}"
+        self.client = mqtt.Client(client_id=self.client_id)
+        
         if self.username and self.password:
             self.client.username_pw_set(self.username, self.password)
 
@@ -32,10 +36,11 @@ class SoundboxMQTTPublisher:
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self._is_connected = True
-            logger.info("Connected to MQTT Broker successfully.")
-            # Subscribe ទៅកាន់ Topic Device Response
+            logger.info(f"MQTT Connected successfully as '{self.client_id}' to {self.broker_host}:{self.broker_port}")
+            
+            # Subscribe ទៅកាន់គ្រប់ Topic Response & Telemetry ទាំងអស់
             client.subscribe("#", qos=1)
-            logger.info("Subscribed to MQTT Topic [#] successfully.")
+            logger.info("Subscribed to MQTT Topic [#] for telemetry and ACK listening.")
         else:
             self._is_connected = False
             logger.error(f"Failed to connect to MQTT Broker, return code: {rc}")
@@ -45,10 +50,11 @@ class SoundboxMQTTPublisher:
             topic = msg.topic
             payload_raw = msg.payload.decode("utf-8")
             data = json.loads(payload_raw)
+            
             if self.on_ack_received:
                 self.on_ack_received(topic, data)
         except Exception as e:
-            pass
+            logger.error(f"Error parsing incoming message on {msg.topic}: {e}")
 
     def connect(self):
         try:
@@ -61,6 +67,7 @@ class SoundboxMQTTPublisher:
         try:
             self.client.loop_stop()
             self.client.disconnect()
+            logger.info("MQTT Publisher stopped cleanly.")
         except Exception as e:
             logger.error(f"Error disconnecting MQTT: {e}")
 
