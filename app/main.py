@@ -77,7 +77,7 @@ logging.basicConfig(
 logger = logging.getLogger("ost_soundbox_gateway")
 
 # ==============================================================================
-# 3. GLOBAL RESOURCES
+# 3. GLOBAL RESOURCES & DEVICE ACK LISTENER
 # ==============================================================================
 db_pool: Optional[asyncpg.Pool] = None
 mqtt_pub: Optional[SoundboxMQTTPublisher] = None
@@ -91,95 +91,54 @@ class SenderType(str, Enum):
     UNAUTHORIZED = "UNAUTHORIZED"
 
 
-# ==============================================================================
-# 4. MQTT INCOMING TELEMETRY & ACK HANDLER
-# ==============================================================================
-async def process_device_telemetry_or_ack(topic: str, data: dict):
+def handle_device_ack_message(topic: str, payload_bytes: bytes):
     """
-    ទទួល និងកត់ត្រា Boot Info (ថ្ម, សេវា, Version) និង ACK Status ពី Topic {SN}/pubmsg
+    Callback ពេល Soundbox ឆ្លើយតបមកវិញតាម Topic {SN}/pubmsg
     """
-    if not db_pool:
-        return
-
     try:
-        # ច្រោះយក Device SN ចេញពី Payload ឬ Topic Name
-        raw_sn = data.get("device_sn")
-        if not raw_sn:
-            topic_clean = topic.strip("/").split("/")[0]
-            raw_sn = topic_clean if topic_clean != "pubmsg" else None
+        payload_str = payload_bytes.decode("utf-8")
+        data = json.loads(payload_str)
         
-        device_sn = str(raw_sn).strip() if raw_sn else "unknown"
-        packet_type = str(data.get("packet_type", "")).lower()
+        device_sn = data.get("device_sn") or topic.split("/")[0].replace("/", "")
+        msg_id = data.get("message_id")
+        packet_type = data.get("packet_type")
         content = data.get("content", {})
-        msg_id = str(data.get("message_id", "")).strip()
+        resp_status = content.get("response_status")
 
-        logger.info(f"📥 Incoming MQTT packet on [{topic}] from SN: {device_sn} (Type: {packet_type})")
+        logger.info(
+            f"🔔 [DEVICE ACK RECEIVED] Topic: {topic} | SN: {device_sn} | "
+            f"Type: {packet_type} | Status: {resp_status} | MsgID: {msg_id}"
+        )
 
-        async with db_pool.acquire() as conn:
-            # ១. ករណីជា Boot Package / Telemetry Report (ស្ថានភាពថ្ម សេវា Version 4G/WiFi)
-            if any(k in packet_type for k in ["boot", "status", "info", "heartbeat"]) or "battery" in content or "bat" in content:
-                battery = str(content.get("battery") or content.get("bat") or "")
-                signal = str(content.get("signal") or content.get("csq") or content.get("rssi") or "")
-                v_4g = str(content.get("version_4g") or content.get("4g_ver") or content.get("4g_version") or "")
-                v_wifi = str(content.get("version_wifi") or content.get("wifi_ver") or content.get("wifi_version") or "")
-
-                await conn.execute(
-                    """
-                    UPDATE devices 
-                    SET battery = COALESCE(NULLIF($1, ''), battery),
-                        signal = COALESCE(NULLIF($2, ''), signal),
-                        version_4g = COALESCE(NULLIF($3, ''), version_4g),
-                        version_wifi = COALESCE(NULLIF($4, ''), version_wifi),
-                        last_online = CURRENT_TIMESTAMP
-                    WHERE device_id = $5
-                    """,
-                    battery, signal, v_4g, v_wifi, device_sn
-                )
-                logger.info(f"💾 Updated Device Info for SN {device_sn}: Battery={battery}%, Signal={signal}")
-
-            # ២. ករណីជា ACK សំឡេងទូទាត់ប្រាក់ (Payment Broadcast Response)
-            if "payment" in packet_type or "rsp" in packet_type or "response_status" in content:
-                resp_status = content.get("response_status", "success")
-                is_success = (str(resp_status).lower() == "success")
-
-                await conn.execute(
-                    """
-                    UPDATE transactions 
-                    SET device_ack = $1,
-                        ack_status = $2,
-                        ack_at = CURRENT_TIMESTAMP
-                    WHERE device_id = $3 
-                      AND (txid = $4 OR raw_payload LIKE '%' || $4 || '%')
-                    """,
-                    is_success, resp_status, device_sn, msg_id
-                )
-                logger.info(f"🔔 Updated Transaction ACK for SN {device_sn} | MsgID: {msg_id} | Status: {resp_status}")
+        # Update ACK status ចូល Database Transaction
+        if db_pool:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_update_ack_in_db(device_sn, msg_id, resp_status))
+            else:
+                asyncio.run(_update_ack_in_db(device_sn, msg_id, resp_status))
 
     except Exception as e:
-        logger.error(f"Error handling device MQTT packet: {e}\n{traceback.format_exc()}")
+        logger.error(f"Error parsing device ACK message: {e}\n{traceback.format_exc()}")
 
 
-def on_mqtt_ack_callback(topic: str, data: dict):
-    """
-    Bridge ពី Sync Paho-MQTT Thread ទៅកាន់ Async Event Loop
-    """
+async def _update_ack_in_db(device_sn: str, msg_id: Optional[str], resp_status: Optional[str]):
     try:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        if not db_pool:
+            return
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE transactions 
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE device_id = $1 AND (raw_payload LIKE '%' || $2 || '%' OR txid = $2)
+                """,
+                device_sn, str(msg_id) if msg_id else ""
+            )
+    except Exception as db_err:
+        logger.warning(f"Could not update ACK status in DB: {db_err}")
 
-        if loop and loop.is_running():
-            asyncio.create_task(process_device_telemetry_or_ack(topic, data))
-        else:
-            asyncio.run(process_device_telemetry_or_ack(topic, data))
-    except Exception as e:
-        logger.error(f"MQTT Callback execution error: {e}")
 
-
-# ==============================================================================
-# 5. LIFESPAN MANAGEMENT
-# ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, mqtt_pub, http_client
@@ -211,10 +170,17 @@ async def lifespan(app: FastAPI):
             broker_host=settings.mqtt_broker,
             broker_port=settings.mqtt_port,
             username=settings.mqtt_user,
-            password=settings.mqtt_password,
-            on_ack_received=on_mqtt_ack_callback
+            password=settings.mqtt_password
         )
         mqtt_pub.connect()
+        
+        # Subscribe ទៅកាន់ Topic ACK របស់ Device ទាំងអស់
+        if hasattr(mqtt_pub, "client") and mqtt_pub.client:
+            mqtt_pub.client.on_message = lambda client, userdata, msg: handle_device_ack_message(msg.topic, msg.payload)
+            mqtt_pub.client.subscribe("+/pubmsg", qos=1)
+            mqtt_pub.client.subscribe("/+/pubmsg", qos=1)
+            logger.info("Subscribed to HEMI Device ACK response topics (+/pubmsg, /+/pubmsg)")
+        
         logger.info("MQTT Client initiated connection loop.")
     except Exception as e:
         logger.critical(f"MQTT connection startup error: {e}\n{traceback.format_exc()}")
@@ -246,7 +212,7 @@ app = FastAPI(
 )
 
 # ==============================================================================
-# 6. FULL REQUEST / RESPONSE LOGGING MIDDLEWARE
+# 4. FULL REQUEST / RESPONSE LOGGING MIDDLEWARE
 # ==============================================================================
 class FullLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -313,8 +279,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # ==============================================================================
-# 7. PYDANTIC SCHEMAS
+# 5. PYDANTIC SCHEMAS
 # ==============================================================================
+class DynamicQRPushRequest(BaseModel):
+    device_sn: str
+    amount_due: float
+    order_id: str
+    qr_url_or_payload: str
+    currency_label: Optional[str] = "KHR"
+    timeout_seconds: Optional[int] = 60
+
+
 class TelegramWebhookPayload(BaseModel):
     message: Optional[Dict[str, Any]] = None
     channel_post: Optional[Dict[str, Any]] = None
@@ -343,7 +318,7 @@ class UserBotPayload(BaseModel):
         extra = "ignore"
 
 # ==============================================================================
-# 8. BUSINESS LOGIC & SERVICES
+# 6. BUSINESS LOGIC & SERVICES
 # ==============================================================================
 class TelegramNotificationService:
     @staticmethod
@@ -519,47 +494,45 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
 
     try:
         async with db_pool.acquire() as conn:
-            clean_chat_id = str(chat_id).strip()
+            # 2. ទាញយក Device ដែលបាន Bind ជាមួយ Telegram Chat ID
             devices = await conn.fetch(
-                """
-                SELECT device_id, device_name 
-                FROM devices 
-                WHERE chat_id = $1 AND is_active = TRUE
-                """,
-                clean_chat_id
+                "SELECT device_id, device_name FROM devices WHERE chat_id = $1 AND is_active = TRUE",
+                str(chat_id).strip()
             )
 
             if not devices:
-                logger.warning(f"No active Soundbox device registered for Telegram Chat ID: {clean_chat_id}")
+                logger.warning(f"No active Soundbox device registered for Telegram Chat ID: {chat_id}")
                 return None
 
             primary_device_id = devices[0]["device_id"]
-            unique_msg_id = str(int(time.time() * 1000))[-10:]
 
-            # 2. កត់ត្រា Transaction ចូល PostgreSQL
+            # 3. កត់ត្រា Transaction ចូល PostgreSQL
             try:
                 await conn.execute(
                     """
                     INSERT INTO transactions (device_id, txid, chat_id, amount, currency, raw_payload)
                     VALUES ($1, $2, $3, $4, $5, $6)
                     """,
-                    primary_device_id, tx.txid, clean_chat_id, float(tx.amount), tx.currency, raw_text
+                    primary_device_id, tx.txid, str(chat_id).strip(), tx.amount, tx.currency, raw_text
                 )
                 logger.info(f"Transaction recorded in Database successfully: TxID {tx.txid}")
             except asyncpg.UniqueViolationError:
                 logger.warning(f"DUPLICATE DETECTED (DB Unique Key): Transaction {tx.txid} already exists.")
                 return None
 
-            # 3. Broadcast ទៅកាន់ HEMI Screen Device តាមស្តង់ដារ Protocol V1.1
+            # 4. Broadcast ទៅកាន់ HEMI Screen Device តាមស្តង់ដារ Protocol V1.1
             sent_devices = []
             for dev in devices:
-                sn = str(dev["device_id"]).strip()
+                sn = dev["device_id"]
                 if mqtt_pub:
                     topic = f"/LLZN/{sn}"
+                    unique_msg_id = str(int(time.time() * 1000))[-10:]
+
+                    # Format Payload តាមស្តង់ដារ HEMI V1.1
                     payload = {
                         "message_id": unique_msg_id,
                         "time_stamp": str(int(time.time())),
-                        "device_sn": sn,
+                        "device_sn": str(sn),
                         "packet_type": "payment",
                         "content": {
                             "play_payment_amount": float(tx.amount)
@@ -582,9 +555,8 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
         logger.error(f"Exception during broadcast soundbox flow: {e}", exc_info=True)
         return None
 
-
 # ==============================================================================
-# 9. ROUTERS & WEBHOOK HANDLERS
+# 7. ROUTERS & WEBHOOK HANDLERS
 # ==============================================================================
 @app.get("/health", status_code=status.HTTP_200_OK)
 @app.get("/", status_code=status.HTTP_200_OK)
@@ -696,11 +668,10 @@ async def telegram_webhook(payload: TelegramWebhookPayload, background_tasks: Ba
                         """,
                         users_to_insert
                     )
-                    logger.info(f"Batch auto-synced {len(users_to_insert)} new members in Chat {chat_id} (is_authorized=FALSE)")
 
                 return {"status": "success", "action": "processed_new_chat_members", "count": len(users_to_insert)}
 
-            # Auto-Sync អ្នកដែលផ្ញើសារទូទៅចូល DB
+            # Auto-Sync អ្នកផ្ញើសារទូទៅ
             if from_user and not from_user.get("is_bot"):
                 sender_id = str(from_user.get("id", "")).strip()
                 s_first = from_user.get("first_name", "")
@@ -716,7 +687,7 @@ async def telegram_webhook(payload: TelegramWebhookPayload, background_tasks: Ba
                     chat_id, sender_id, from_user.get("username"), s_first, s_last, s_name
                 )
 
-            # ៤. EVENT: COMMANDS
+            # ៤. COMMANDS
             if raw_text.lower().startswith(("/id", "/chatid", "/setup", "/start", "/pay")):
                 background_tasks.add_task(TelegramNotificationService.send_welcome_qr, chat_id)
                 return {"status": "success", "action": "sent_welcome_qr_command", "chat_id": chat_id}
@@ -778,7 +749,7 @@ async def telegram_userbot_webhook(request: Request):
         )
 
         async with db_pool.acquire() as conn:
-            # ១. ផ្ទៀងផ្ទាត់ Identity & Anti-Fraud
+            # ១. ផ្ទៀងផ្ទាត់ Identity
             sender_type = await authenticate_and_classify_sender(conn, chat_id, userbot_obj)
 
             # ២. Allow Bank Sender ឬ Authorized Admin
@@ -811,3 +782,67 @@ async def telegram_userbot_webhook(request: Request):
     except Exception as e:
         logger.error(f"Error handling Telegram userbot webhook: {e}\n{traceback.format_exc()}")
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==============================================================================
+# 8. ADVANCED PROTOCOL: DYNAMIC QR PUSH & SCREEN CONFIGURATION
+# ==============================================================================
+@app.post("/api/push_dynamic_qr", status_code=status.HTTP_200_OK)
+async def push_dynamic_qr_to_screen(
+    req: DynamicQRPushRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    """
+    អនុវត្តតាម HEMI Protocol V1.1 (Section 5 - Step 1):
+    រុញ Dynamic QR Code ទៅបង្ហាញលើ Screen របស់ Soundbox ជាមួយចំនួនទឹកប្រាក់
+    """
+    if x_api_key != settings.api_secret_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid X-API-Key")
+
+    if not mqtt_pub:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="MQTT Publisher unavailable")
+
+    topic = f"/LLZN/{req.device_sn}"
+    unique_msg_id = str(int(time.time() * 1000))[-10:]
+
+    label_text = f"{req.amount_due:,.0f} {req.currency_label}" if req.currency_label == "KHR" else f"${req.amount_due:,.2f}"
+
+    payload = {
+        "message_id": unique_msg_id,
+        "time_stamp": str(int(time.time())),
+        "device_sn": str(req.device_sn),
+        "packet_type": "wait_payment",
+        "content": {
+            "amount_due": float(req.amount_due),
+            "order_id": str(req.order_id),
+            "payment_timeout": int(req.timeout_seconds or 60),
+            "screen_content_config": {
+                "wait_payment_screen_qrcode_1_config": {
+                    "txt": str(req.qr_url_or_payload),
+                    "x": 0,
+                    "y": 0,
+                    "hei": 210
+                },
+                "wait_payment_screen_label_3_config": {
+                    "txt": label_text,
+                    "x": 0,
+                    "y": 0,
+                    "hei": 24,
+                    "col": "FF0000"
+                }
+            }
+        }
+    }
+
+    res = await mqtt_pub.publish_voice_payload(topic=topic, payload=payload, qos=1)
+
+    if not res.get("success"):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"MQTT publish failed: {res.get('error')}")
+
+    return {
+        "status": "success",
+        "message": "Dynamic QR successfully pushed to HEMI Screen",
+        "device_sn": req.device_sn,
+        "order_id": req.order_id,
+        "latency_ms": res.get("latency_ms")
+    }
