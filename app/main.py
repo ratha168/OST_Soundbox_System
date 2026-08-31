@@ -623,7 +623,7 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
                         sent_devices.append(sn)
                         logger.info(f"HEMI payment broadcast sent to device SN {sn} on {topic} (Latency: {res.get('latency_ms')}ms)")
 
-                        # កត់ត្រា ACK = TRUE តាម txid ភ្លាមៗ
+                        # កត់ត្រា ACK = TRUE តាម txid ដោយផ្ទាល់
                         await conn.execute(
                             """
                             UPDATE transactions 
@@ -634,9 +634,9 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
                             """,
                             tx.txid
                         )
-                        logger.info(f"✅ Transaction ACK Auto-Saved to DB [TxID: {tx.txid}]")
-                else:
-                    logger.error("MQTT Publisher instance is not available.")
+                        logger.info(f"✅ DB ACK FORCED TRUE [TxID: {tx.txid}]")
+                    else:
+                        logger.error(f"MQTT publish failed to device {sn}: {res.get('message') or res.get('error')}")
 
             return sent_devices
 
