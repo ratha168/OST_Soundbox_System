@@ -12,8 +12,14 @@ class Transaction:
     currency: str
     payer: str
 
+    @property
+    def bank_name(self) -> str:
+        return self.bank
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["bank_name"] = self.bank
+        return data
 
 
 class CurrencyNormalizer:
@@ -61,53 +67,53 @@ class BankPatternRule:
             txid=data["txid"].strip(),
             amount=amount,
             currency=currency,
-            payer=data["payer"].strip()
+            payer=data.get("payer", "").strip()
         )
 
 
 class BankNotificationParser:
     RULES: List[BankPatternRule] = [
-        # 1. CMC / Canadia KHQR Merchant Pattern
+        # 1. ABA KHQR / PayWay Pattern (៛54,000 paid by ... Trx. ID: 178818498870481 ឬ $40.50 paid by ...)
         BankPatternRule(
-            bank_name="CMC_KHQR",
+            bank_name="ABA_PayWay",
             regex_str=(
-                r"(?P<currency>KHR|USD)\s+(?P<amount>[\d,]+(?:\.\d{2})?)\s+"
-                r"is\s+paid\s+by\s+.*?\s+"
-                r"for\s+purchase\s+(?P<txid>[a-zA-Z0-9]+),\s*"
-                r"from\s+(?P<payer>.+?),\s*at\s+"
-            )
-        ),
-        # 2. ACLEDA / Wing Khmer Pattern
-        BankPatternRule(
-            bank_name="ACLEDA",
-            regex_str=(
-                r"បានទទួល\s+(?P<amount>[\d,]+(?:\.\d{2})?)\s+(?P<currency>រៀល|ដុល្លារ|\$|USD|KHR)\s+"
-                r"ពី\s+(?P<payer>.+?),\s*"
-                r"ថ្ងៃទី.+?,\s*"
-                r"លេខយោង\s+(?P<txid>\w+)"
-            )
-        ),
-        # 3. ABA KHQR Merchant Pattern
-        BankPatternRule(
-            bank_name="ABA_KHQR",
-            regex_str=(
-                r"(?P<currency>៛|\$)?\s*(?P<amount>[\d,]+(?:\.\d{2})?)\s+"
+                r"(?P<currency>៛|\$|KHR|USD)?\s*(?P<amount>[\d,]+(?:\.\d+)?)\s+"
                 r"paid\s+by\s+(?P<payer>.+?)(?:\s*\(\*\d+\))?\s+"
                 r"on\s+.*?"
                 r"Trx\.\s*ID:\s*(?P<txid>\w+)"
             ),
             default_currency="USD"
         ),
+        # 2. CMC / Canadia KHQR Merchant Pattern
+        BankPatternRule(
+            bank_name="CMC_KHQR",
+            regex_str=(
+                r"(?P<currency>KHR|USD)\s+(?P<amount>[\d,]+(?:\.\d+)?)\s+"
+                r"is\s+paid\s+by\s+.*?\s+"
+                r"for\s+purchase\s+(?P<txid>[a-zA-Z0-9]+),\s*"
+                r"from\s+(?P<payer>.+?),\s*at\s+"
+            )
+        ),
+        # 3. ACLEDA / Wing Khmer Pattern (បានទទួល 6,000 រៀល ពី 087**7036... លេខយោង 62432121316)
+        BankPatternRule(
+            bank_name="ACLEDA",
+            regex_str=(
+                r"បានទទួល\s+(?P<amount>[\d,]+(?:\.\d+)?)\s+(?P<currency>រៀល|ដុល្លារ|\$|USD|KHR)\s+"
+                r"ពី\s+(?P<payer>.+?),\s*"
+                r"ថ្ងៃទី.+?,\s*"
+                r"លេខយោង\s+(?P<txid>\w+)"
+            )
+        ),
         # 4. ABA Standard App Notification
         BankPatternRule(
             bank_name="ABA",
-            regex_str=r"Received\s+\$(?P<amount>\d+(?:\.\d{2})?)\s+from\s+(?P<payer>.+?)\s*\(Trx\s*ID:\s*(?P<txid>\w+)\)",
+            regex_str=r"Received\s+\$(?P<amount>[\d,]+(?:\.\d+)?)\s+from\s+(?P<payer>.+?)\s*\(Trx\s*ID:\s*(?P<txid>\w+)\)",
             default_currency="USD"
         ),
         # 5. ACLEDA English Pattern
         BankPatternRule(
             bank_name="ACLEDA",
-            regex_str=r"Received\s+(?P<amount>[\d,]+(?:\.\d{2})?)\s+(?P<currency>KHR|USD)\s+from\s+(?P<payer>.+?)\s*\(Ref:\s*(?P<txid>\w+)\)"
+            regex_str=r"Received\s+(?P<amount>[\d,]+(?:\.\d+)?)\s+(?P<currency>KHR|USD)\s+from\s+(?P<payer>.+?)\s*\(Ref:\s*(?P<txid>\w+)\)"
         ),
     ]
 
@@ -139,6 +145,5 @@ class BankNotificationParser:
         return None
 
 
-# Module-level alias to satisfy `from app.telegram_parser import parse_bank_message` in main.py
 def parse_bank_message(text: str) -> Optional[Dict[str, Any]]:
     return BankNotificationParser.parse_message(text)
