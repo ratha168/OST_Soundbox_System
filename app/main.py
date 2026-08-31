@@ -185,20 +185,19 @@ async def process_device_packet_direct(topic: str, data: dict):
                 )
                 logger.info(f"✅ DB SAVED SUCCESSFULLY [SN: {device_sn}] -> Battery: {battery_str}, Signal: {signal_str}")
 
-            # ២. Payment ACK
-            elif any(k in packet_type for k in ["payment", "rsp", "ack"]) or "response_status" in content or "play_status" in content:
-                resp_status = content.get("response_status") or content.get("play_status") or "success"
-                is_success = (str(resp_status).lower() in ["success", "ok", "0", "true"])
+            # ២. Payment ACK (ចាប់យកគ្រប់ Response ក្រោយពេលចាក់សំឡេង)
+            else:
+                resp_status = content.get("response_status") or content.get("play_status") or content.get("status") or "success"
+                is_success = str(resp_status).lower() in ["success", "ok", "0", "true", "play_end", "finish"]
 
-                # Update ទៅលើ Transaction ចុងក្រោយបង្អស់របស់ Device នោះ
                 await conn.execute(
                     """
                     UPDATE transactions 
                     SET device_ack = $1,
                         ack_status = $2,
                         ack_at = CURRENT_TIMESTAMP
-                    WHERE id = (
-                        SELECT id FROM transactions 
+                    WHERE ctid = (
+                        SELECT ctid FROM transactions 
                         WHERE device_id = $3 
                         ORDER BY created_at DESC 
                         LIMIT 1
@@ -206,7 +205,7 @@ async def process_device_packet_direct(topic: str, data: dict):
                     """,
                     is_success, str(resp_status), device_sn
                 )
-                logger.info(f"✅ Transaction ACK Updated Successfully [SN: {device_sn}] | Status: {resp_status}")
+                logger.info(f"✅ Transaction ACK Updated via ctid [SN: {device_sn}] | Status: {resp_status}")
 
     except Exception as e:
         logger.error(f"Error executing DB update from MQTT packet: {e}\n{traceback.format_exc()}")
