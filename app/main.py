@@ -438,7 +438,7 @@ async def unified_telegram_webhook(request: Request):
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 # ==============================================================================
-# FUNCTION: ទាញទិន្នន័យពី Postgres រួចបាញ់ Set Static KHQR ទៅ Soundbox
+# SYNC STATIC KHQR FUNCTION & ROUTER
 # ==============================================================================
 async def sync_device_static_khqr_from_db(device_sn: str) -> Dict[str, Any]:
     if not db_pool:
@@ -447,7 +447,6 @@ async def sync_device_static_khqr_from_db(device_sn: str) -> Dict[str, Any]:
         return {"success": False, "error": "MQTT Publisher not ready"}
 
     async with db_pool.acquire() as conn:
-        # ១. ទាញទិន្នន័យ KHQR និង merchant_id ពី PostgreSQL
         device = await conn.fetchrow(
             """
             SELECT device_id, device_name, khqr_data, shop_name, merchant_id 
@@ -467,7 +466,6 @@ async def sync_device_static_khqr_from_db(device_sn: str) -> Dict[str, Any]:
         shop_name = device["shop_name"] or device["device_name"] or "Scan to Pay"
         merchant_display_id = f"ID: {device['merchant_id']}" if device["merchant_id"] else f"ID: {device_sn}"
 
-        # ២. បង្កើត MQTT Payload តាម Vendor Protocol (set_device_info)
         topic = f"/LLZN/{device_sn}"
         unique_msg_id = str(int(time.time() * 1000))[-10:]
 
@@ -502,19 +500,15 @@ async def sync_device_static_khqr_from_db(device_sn: str) -> Dict[str, Any]:
             }
         }
 
-        # ៣. Publish ទៅកាន់ HEMI Screen Device
         res = await mqtt_pub.publish_voice_payload(topic=topic, payload=payload, qos=1)
         if res.get("success"):
-            logger.info(f"✅ [KHQR SYNCED] Successfully pushed Static KHQR to screen for SN: {device_sn}")
+            logger.info(f"✅ [KHQR SYNCED] Pushed Static KHQR to screen for SN: {device_sn}")
             return {"success": True, "device_sn": device_sn, "shop_name": shop_name, "merchant_id": device["merchant_id"], "latency_ms": res.get("latency_ms")}
         else:
             logger.error(f"❌ [KHQR SYNC FAILED] MQTT error: {res.get('error')}")
             return {"success": False, "error": res.get("error")}
 
 
-# ==============================================================================
-# ROUTER: API Trigger Push Static KHQR ពី Postgres
-# ==============================================================================
 @app.post("/api/devices/{device_sn}/push-static-khqr", status_code=status.HTTP_200_OK)
 async def api_push_static_khqr(
     device_sn: str,
