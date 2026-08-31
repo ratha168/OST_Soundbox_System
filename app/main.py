@@ -561,7 +561,7 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
         logger.error("Cannot broadcast soundbox: Database pool is None.")
         return None
 
-    # 1. ពិនិត្យ De-duplication តាមរយៈ Redis
+    # 1. De-duplication តាមរយៈ Redis
     try:
         if is_duplicate_transaction(tx.txid):
             logger.warning(f"DUPLICATE DETECTED (Redis): Suppressed TxID: {tx.txid}")
@@ -602,7 +602,7 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
                 logger.warning(f"DUPLICATE DETECTED (DB Unique Key): Transaction {tx.txid} already exists.")
                 return None
 
-            # 3. Broadcast ទៅកាន់ HEMI Screen Device តាមស្តង់ដារ Protocol V1.1
+            # 3. Broadcast ទៅកាន់ HEMI Soundbox
             sent_devices = []
             for dev in devices:
                 sn = str(dev["device_id"]).strip()
@@ -623,6 +623,18 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
                     if res.get("success"):
                         sent_devices.append(sn)
                         logger.info(f"HEMI payment broadcast sent to device SN {sn} on {topic} (Latency: {res.get('latency_ms')}ms)")
+
+                        # កត់ត្រា ACK = True ភ្លាមៗនៅពេល MQTT បញ្ជូនទៅដល់ Soundbox ដោយជោគជ័យ
+                        await conn.execute(
+                            """
+                            UPDATE transactions 
+                            SET device_ack = TRUE,
+                                ack_status = 'success',
+                                ack_at = CURRENT_TIMESTAMP
+                            WHERE txid = $1
+                            """,
+                            tx.txid
+                        )
                     else:
                         logger.error(f"MQTT publish failed to device {sn}: {res.get('message') or res.get('error')}")
                 else:
