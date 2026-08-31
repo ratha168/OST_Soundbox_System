@@ -115,13 +115,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize HTTP client: {e}")
 
+   # ក្នុង async def lifespan(app: FastAPI):
     logger.info(f"Connecting to MQTT Broker at {settings.mqtt_broker}:{settings.mqtt_port}...")
     try:
         mqtt_pub = SoundboxMQTTPublisher(
             broker_host=settings.mqtt_broker,
             broker_port=settings.mqtt_port,
             username=settings.mqtt_user,
-            password=settings.mqtt_password
+            password=settings.mqtt_password,
+            on_ack_received=on_mqtt_ack_callback  # បន្ថែម Callback ត្រង់នេះ
         )
         mqtt_pub.connect()
         logger.info("MQTT Client initiated connection loop.")
@@ -427,7 +429,6 @@ async def authenticate_and_classify_sender(
         logger.error(f"Error during sender classification: {e}\n{traceback.format_exc()}")
         return SenderType.UNAUTHORIZED
 
-
 async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_text: str = "") -> Optional[List[str]]:
     if not db_pool:
         logger.error("Cannot broadcast soundbox: Database pool is None.")
@@ -507,7 +508,58 @@ async def broadcast_soundbox_notification(tx: Transaction, chat_id: str, raw_tex
     except Exception as e:
         logger.error(f"Exception during broadcast soundbox flow: {e}", exc_info=True)
         return None
-    
+
+async def process_device_ack(topic: str, data: dict):
+    """
+    កត់ត្រា Status ឆ្លើយតបពី Soundbox ចូល Database
+    """
+    if not db_pool:
+        return
+
+    try:
+        device_sn = str(data.get("device_sn") or topic.split("/")[0].replace("/", "")).strip()
+        msg_id = str(data.get("message_id", "")).strip()
+        packet_type = data.get("packet_type", "")
+        content = data.get("content", {})
+        resp_status = content.get("response_status", "unknown")
+
+        logger.info(
+            f"🔔 [SOUNDBOX ACK] Device: {device_sn} | MsgID: {msg_id} | "
+            f"Type: {packet_type} | Status: {resp_status}"
+        )
+
+        async with db_pool.acquire() as conn:
+            # Update Transaction តាមរយៈ device_id និង message_id ឬ txid
+            result = await conn.execute(
+                """
+                UPDATE transactions 
+                SET device_ack = ($1 = 'success'),
+                    ack_status = $1,
+                    ack_at = CURRENT_TIMESTAMP
+                WHERE device_id = $2 
+                  AND (txid = $3 OR raw_payload LIKE '%' || $3 || '%')
+                """,
+                resp_status, device_sn, msg_id
+            )
+            logger.info(f"DB Update ACK completed for SN {device_sn}: {result}")
+
+    except Exception as e:
+        logger.error(f"Failed to record ACK in DB: {e}\n{traceback.format_exc()}")
+
+def on_mqtt_ack_callback(topic: str, data: dict):
+    """
+    Bridge ពី Sync MQTT Callback ទៅកាន់ Async Database Task
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        asyncio.create_task(process_device_ack(topic, data))
+    else:
+        asyncio.run(process_device_ack(topic, data))
+
 # ==============================================================================
 # 7. ROUTERS & WEBHOOK HANDLERS
 # ==============================================================================

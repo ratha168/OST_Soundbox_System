@@ -1,190 +1,83 @@
-import os
 import json
-import time
-import uuid
 import logging
-import asyncio
-from typing import Optional, Dict, Any, Union
+import time
+from typing import Callable, Optional
 import paho.mqtt.client as mqtt
 
-logger = logging.getLogger("Soundbox_MQTT_Advanced")
+logger = logging.getLogger("soundbox_mqtt")
 
-
-class AdvancedSoundboxMQTTPublisher:
+class SoundboxMQTTPublisher:
     def __init__(
         self,
-        broker_host: Optional[str] = None,
-        broker_port: Optional[int] = None,
-        client_id: Optional[str] = None,
-        keepalive: int = 30,
+        broker_host: str,
+        broker_port: int = 1883,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        on_ack_received: Optional[Callable[[str, dict], None]] = None
     ):
-        self.broker_host = broker_host or os.getenv("MQTT_BROKER", "mosquitto")
-        self.broker_port = int(broker_port or os.getenv("MQTT_PORT", 1883))
-        self.keepalive = keepalive
-        self.username = username or os.getenv("MQTT_USERNAME")
-        self.password = password or os.getenv("MQTT_PASSWORD")
+        self.broker_host = broker_host
+        self.broker_port = broker_port
+        self.username = username
+        self.password = password
+        self.on_ack_received = on_ack_received
         
-        # បង្កើត Unique Client ID ការពារកុំឱ្យជាន់គ្នា
-        unique_suffix = uuid.uuid4().hex[:6]
-        base_id = client_id or "fastapi_soundbox_publisher"
-        self.client_id = f"{base_id}_{unique_suffix}"
-
-        self._connected = False
-        self._published_mid_tracker: Dict[int, asyncio.Event] = {}
-
-        # 1. Initialize Paho-MQTT client
-        try:
-            self.client = mqtt.Client(
-                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-                client_id=self.client_id,
-                clean_session=True
-            )
-        except AttributeError:
-            self.client = mqtt.Client(client_id=self.client_id, clean_session=True)
-
-        # 2. Configure Credentials
+        self.client = mqtt.Client(client_id=f"fastapi_soundbox_{int(time.time())}")
         if self.username and self.password:
             self.client.username_pw_set(self.username, self.password)
 
-        # 3. Callbacks
         self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_publish = self._on_publish
+        self.client.on_message = self._on_message
+        self._is_connected = False
 
-    def _on_connect(self, client, userdata, flags, rc, properties=None):
-        rc_code = rc if isinstance(rc, int) else rc.value
-        if rc_code == 0:
-            self._connected = True
-            logger.info(
-                f"[Soundbox_MQTT_Advanced]: MQTT Connected successfully as '{self.client_id}' to {self.broker_host}:{self.broker_port}"
-            )
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self._is_connected = True
+            logger.info("Connected to MQTT Broker successfully.")
+            # Subscribe ទៅកាន់ Topic Response របស់ Device ទាំងអស់
+            client.subscribe("+/pubmsg", qos=1)
+            client.subscribe("/+/pubmsg", qos=1)
+            logger.info("Subscribed to device ACK topics: +/pubmsg, /+/pubmsg")
         else:
-            self._connected = False
-            reasons = {
-                1: "Incorrect protocol version",
-                2: "Invalid client identifier",
-                3: "Server unavailable",
-                4: "Bad username or password",
-                5: "Not authorized",
-            }
-            logger.error(
-                f"[Soundbox_MQTT_Advanced]: MQTT Connection refused: {reasons.get(rc_code, rc_code)}"
-            )
+            self._is_connected = False
+            logger.error(f"Failed to connect to MQTT Broker, return code: {rc}")
 
-    def _on_disconnect(self, client, userdata, *args, **kwargs):
-        self._connected = False
-        rc_code = 0
-        if args:
-            last_arg = args[1] if len(args) > 1 else args[0]
-            rc_code = last_arg if isinstance(last_arg, int) else getattr(last_arg, "value", 0)
+    def _on_message(self, client, userdata, msg):
+        try:
+            topic = msg.topic
+            payload_raw = msg.payload.decode("utf-8")
+            data = json.loads(payload_raw)
+            logger.info(f"MQTT Message Received on [{topic}]: {data}")
 
-        if rc_code != 0:
-            logger.warning(
-                f"[Soundbox_MQTT_Advanced]: Unexpected MQTT disconnection (rc: {rc_code}). Attempting background reconnection..."
-            )
-        else:
-            logger.info("[Soundbox_MQTT_Advanced]: Advanced MQTT Publisher disconnected cleanly.")
-
-    def _on_publish(self, client, userdata, mid, reason_codes=None, properties=None):
-        if mid in self._published_mid_tracker:
-            self._published_mid_tracker[mid].set()
+            if self.on_ack_received:
+                self.on_ack_received(topic, data)
+        except Exception as e:
+            logger.error(f"Error handling incoming MQTT message on {msg.topic}: {e}")
 
     def connect(self):
         try:
-            logger.info(f"[Soundbox_MQTT_Advanced]: Connecting to MQTT Broker {self.broker_host}:{self.broker_port}...")
-            self.client.connect(host=self.broker_host, port=self.broker_port, keepalive=self.keepalive)
+            self.client.connect(self.broker_host, self.broker_port, keepalive=60)
             self.client.loop_start()
         except Exception as e:
-            logger.error(f"[Soundbox_MQTT_Advanced]: Failed to initiate MQTT connection: {e}", exc_info=True)
+            logger.error(f"Cannot start MQTT loop: {e}")
 
     def disconnect(self):
         try:
             self.client.loop_stop()
             self.client.disconnect()
-            self._connected = False
-            logger.info("[Soundbox_MQTT_Advanced]: MQTT Publisher stopped cleanly.")
         except Exception as e:
-            logger.error(f"[Soundbox_MQTT_Advanced]: Error during MQTT disconnect: {e}")
-
-    start = connect
-    stop = disconnect
+            logger.error(f"Error disconnecting MQTT: {e}")
 
     def is_connected(self) -> bool:
-        return bool(self._connected)
+        return self._is_connected
 
-    async def publish_voice_payload(
-        self,
-        topic: str,
-        payload: Union[dict, list, str],
-        qos: int = 1,
-        retain: bool = False,
-        timeout: float = 5.0,
-    ) -> Dict[str, Any]:
-        start_time = time.perf_counter()
-
-        if not self._connected:
-            latency = (time.perf_counter() - start_time) * 1000
-            return {
-                "success": False,
-                "status": "error",
-                "message": "MQTT Broker is not connected",
-                "topic": topic,
-                "latency_ms": round(latency, 2),
-                "timestamp": int(time.time()),
-            }
-
-        if isinstance(payload, (dict, list)):
-            formatted_payload = json.dumps(payload, ensure_ascii=False)
-        else:
-            formatted_payload = str(payload)
-
+    async def publish_voice_payload(self, topic: str, payload: dict, qos: int = 1) -> dict:
+        start_time = time.time()
         try:
-            msg_info = self.client.publish(topic=topic, payload=formatted_payload, qos=qos, retain=retain)
-            publish_event = asyncio.Event()
-            self._published_mid_tracker[msg_info.mid] = publish_event
-
-            try:
-                await asyncio.wait_for(publish_event.wait(), timeout=timeout)
-                latency = (time.perf_counter() - start_time) * 1000
-                return {
-                    "success": True,
-                    "status": "delivered",
-                    "mid": msg_info.mid,
-                    "topic": topic,
-                    "qos": qos,
-                    "retained": retain,
-                    "latency_ms": round(latency, 2),
-                    "payload_size_bytes": len(formatted_payload.encode("utf-8")),
-                    "timestamp": int(time.time()),
-                }
-            except asyncio.TimeoutError:
-                latency = (time.perf_counter() - start_time) * 1000
-                return {
-                    "success": False,
-                    "status": "timeout",
-                    "mid": msg_info.mid,
-                    "topic": topic,
-                    "message": f"Broker acknowledgment timed out after {timeout}s",
-                    "latency_ms": round(latency, 2),
-                    "timestamp": int(time.time()),
-                }
-            finally:
-                self._published_mid_tracker.pop(msg_info.mid, None)
-
+            payload_str = json.dumps(payload)
+            info = self.client.publish(topic, payload_str, qos=qos)
+            info.wait_for_publish(timeout=2.0)
+            latency = (time.time() - start_time) * 1000.0
+            return {"success": True, "latency_ms": round(latency, 2)}
         except Exception as e:
-            latency = (time.perf_counter() - start_time) * 1000
-            return {
-                "success": False,
-                "status": "failed",
-                "topic": topic,
-                "error": str(e),
-                "latency_ms": round(latency, 2),
-                "timestamp": int(time.time()),
-            }
-
-    publish = publish_voice_payload
-
-
-SoundboxMQTTPublisher = AdvancedSoundboxMQTTPublisher
+            latency = (time.time() - start_time) * 1000.0
+            return {"success": False, "error": str(e), "latency_ms": round(latency, 2)}
