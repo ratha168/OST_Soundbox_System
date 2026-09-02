@@ -1,66 +1,48 @@
+version: '3.8'
+
 services:
   postgres:
-    image: postgres:15-alpine
-    container_name: iot_postgres
+    image: postgres:16-alpine
+    container_name: postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: fDdiFw_KB2930otN
       POSTGRES_DB: postgres
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    restart: always
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
 
   mosquitto:
     image: eclipse-mosquitto:2.0
-    container_name: iot_mosquitto
+    container_name: mosquitto
     ports:
       - "1883:1883"
-      - "9001:9001"
     volumes:
-      - /var/www/mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf
-      - /var/www/mosquitto/data:/mosquitto/data
-      - /var/www/mosquitto/log:/mosquitto/log
-    restart: always
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
 
   fastapi-gateway:
     build:
       context: .
-    container_name: iot_fastapi_gateway
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/app
+      dockerfile: Dockerfile
+    container_name: fastapi-gateway
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
     ports:
       - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://postgres:fDdiFw_KB2930otN@postgres:5432/postgres
-      - MQTT_HOST=mosquitto
-      - MQTT_PORT=1883
-      - API_SECRET_KEY=your-api-key
     depends_on:
       - postgres
+      - redis
       - mosquitto
-    restart: always
-
-  userbot:
-    build:
-      context: .
-    container_name: iot_telegram_userbot
-    command: python -m app.Telegram.adapter_telegram_userbot
-    volumes:
-      - .:/app
-      - ./userbot_session.session:/app/userbot_session.session
-      - ./userbot_state.json:/app/userbot_state.json
     environment:
-      - TELEGRAM_API_ID=34687255
-      - TELEGRAM_API_HASH=0c8a94e104d60fe54bf05605122ae878
-      - FASTAPI_USERBOT_URL=http://fastapi-gateway:8000/webhook/telegram-userbot
-      - FASTAPI_SYNC_USER_URL=http://fastapi-gateway:8000/api/users/sync
-      - API_SECRET_KEY=your-api-key
-    depends_on:
-      - fastapi-gateway
-    restart: always
+      DATABASE_URL: postgresql://postgres:fDdiFw_KB2930otN@postgres:5432/postgres
+      REDIS_HOST: redis
+      MQTT_HOST: mosquitto
 
 volumes:
   pgdata:
