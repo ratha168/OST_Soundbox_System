@@ -65,7 +65,8 @@ class BroadcastService:
                 currency=tx.currency,
                 message_id=unique_msg_id,
             )
-
+            # ត្រង់កន្លែងរៀបចំ payload និង publish ទៅ mqtt
+            logger.info(f"[DEBUG_FEISHU_PAYLOAD] Topic: {topic} | Payload: {payload}")
             res = await self._mqtt_pub.publish(topic=topic, payload=payload, qos=1)
             if res.get("success"):
                 dispatched_devices.append(sn)

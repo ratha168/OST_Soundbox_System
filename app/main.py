@@ -69,8 +69,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="OST Enterprise Soundbox Gateway - V3",
-    version="3.0.0",
+    title="OST Soundbox System Gateway",
+    version="0.0.8",
     lifespan=lifespan
 )
 

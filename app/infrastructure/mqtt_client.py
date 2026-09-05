@@ -53,10 +53,9 @@ class AsyncMqttPublisher:
             self._is_connected = False
             logger.error(f"Failed to connect to MQTT, return code: {rc}")
 
-    def _on_disconnect(self, client, userdata, rc, properties=None):
+    def _on_disconnect(self, client, userdata, *args, **kwargs):
         self._is_connected = False
-        if rc != 0:
-            logger.warning("Unexpected MQTT disconnection. Auto-reconnecting...")
+        logger.warning("Unexpected MQTT disconnection. Auto-reconnecting...")
 
     def _on_message(self, client, userdata, msg):
         try:
