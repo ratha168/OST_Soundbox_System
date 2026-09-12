@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-
 class BaseSoundboxSupplier(ABC):
     """Abstract Strategy interface for soundbox hardware vendors."""
 
@@ -21,7 +20,6 @@ class BaseSoundboxSupplier(ABC):
     ) -> Dict[str, Any]:
         """Constructs vendor-compliant JSON voice payload."""
         pass
-
 
 class HemiSupplier(BaseSoundboxSupplier):
     """Strategy implementation for HEMI Cloud Speakers."""
@@ -46,7 +44,6 @@ class HemiSupplier(BaseSoundboxSupplier):
             },
         }
 
-
 class FeishuSupplier(BaseSoundboxSupplier):
     """
     Advanced Khmer & USD Voice Strategy for Feishu 4G Cloud Soundbox.
@@ -55,43 +52,41 @@ class FeishuSupplier(BaseSoundboxSupplier):
 
     PRODUCT_ID = "XHKX8L74OB"
 
-    # សំឡេងបើកក្បាល និង រូបិយប័ណ្ណ (Khmer MP3 slices)
+    # ក្រុមទី ១៖ សំឡេងប្រព័ន្ធ និង រូបិយប័ណ្ណ (000 - 009)
     CODE_PROMPT_RECEIVED = "000"  # ទទួលប្រាក់
-    CODE_CURRENCY_USD = "001"     # ដុល្លារ
-    CODE_CURRENCY_KHR = "002"     # រៀល
-    CODE_CURRENCY_CENT = "003"    # សេន
+    CODE_CURRENCY_USD    = "001"  # ដុល្លារ
+    CODE_CURRENCY_KHR    = "002"  # រៀល
+    CODE_CURRENCY_CENT   = "003"  # សេន
+    CODE_DOT             = "004"  # ក្បៀស / ចុច
 
-    # លេខ 0 ដល់ 9
+    # ក្រុមទី ២៖ លេខរាយ 0 ដល់ 9 (010 - 019) -> [កែតម្រូវកុំឱ្យជាន់ជាមួយរូបិយប័ណ្ណ]
     DIGITS_MAP = {
-        0: "000", 1: "001", 2: "002", 3: "003", 4: "004",
-        5: "005", 6: "006", 7: "007", 8: "008", 9: "009"
+        0: "010", 1: "011", 2: "012", 3: "013", 4: "014",
+        5: "015", 6: "016", 7: "017", 8: "018", 9: "019"
     }
 
-    # លេខ 10 ដល់ 19
+    # ក្រុមទី ៣៖ លេខ 10 ដល់ 19 (020 - 029)
     TEENS_MAP = {
-        10: "010", 11: "011", 12: "012", 13: "013", 14: "014",
-        15: "015", 16: "016", 17: "017", 18: "018", 19: "019"
+        10: "020", 11: "021", 12: "022", 13: "023", 14: "024",
+        15: "025", 16: "026", 17: "027", 18: "028", 19: "029"
     }
 
-    # ខ្ទង់ដប់ (២០ ដល់ ៩០)
+    # ក្រុមទី ៤៖ ខ្ទង់ដប់ 20 ដល់ 90 (030 - 037)
     TENS_MAP = {
-        20: "020", 30: "030", 40: "040", 50: "050",
-        60: "060", 70: "070", 80: "080", 90: "090"
+        20: "030", 30: "031", 40: "032", 50: "033",
+        60: "034", 70: "035", 80: "036", 90: "037"
     }
 
-    # ខ្ទង់រាប់ភាសាខ្មែរ
-    CODE_HUNDRED = "100"           # រយ
-    CODE_THOUSAND = "101"          # ពាន់
-    CODE_TEN_THOUSAND = "102"      # ម៉ឺន
+    # ក្រុមទី ៥៖ ខ្ទង់រាប់ធំៗរបស់ខ្មែរ (100+)
+    CODE_HUNDRED          = "100"  # រយ
+    CODE_THOUSAND         = "101"  # ពាន់
+    CODE_TEN_THOUSAND     = "102"  # ម៉ឺន
     CODE_HUNDRED_THOUSAND = "103"  # សែន
-    CODE_MILLION = "104"           # លាន
+    CODE_MILLION          = "104"  # លាន
 
     def get_downlink_topic(self, device_sn: str) -> str:
         raw_sn = device_sn.strip()
-        if "/" in raw_sn:
-            clean_sn = raw_sn.split("/")[-1].strip()
-        else:
-            clean_sn = raw_sn
+        clean_sn = raw_sn.split("/")[-1].strip() if "/" in raw_sn else raw_sn
         clean_sn = re.sub(r"[^A-Za-z0-9]", "", clean_sn)
         return f"{self.PRODUCT_ID}/{clean_sn}/data"
 
@@ -149,6 +144,7 @@ class FeishuSupplier(BaseSoundboxSupplier):
     def build_payment_payload(
         self, device_sn: str, amount: float, currency: str, message_id: str
     ) -> Dict[str, Any]:
+        
         codes: List[str] = [self.CODE_PROMPT_RECEIVED]
         curr = currency.strip().upper()
 
@@ -172,6 +168,7 @@ class FeishuSupplier(BaseSoundboxSupplier):
                 codes.append(self.CODE_CURRENCY_CENT)
 
             amount_str = f"{val:.2f}" if cents > 0 else str(dollars)
+            
         else:
             # លំនាំដើមជាប្រាក់រៀល (KHR)
             int_amt = int(round(val))
@@ -179,6 +176,7 @@ class FeishuSupplier(BaseSoundboxSupplier):
             codes.append(self.CODE_CURRENCY_KHR)
             amount_str = str(int_amt)
 
+        # ចងក្រង JSON ផ្ញើទៅ Feishu ម៉ាស៊ីន
         payload = {
             "cmd": "voice",
             "amount": amount_str,
@@ -187,13 +185,10 @@ class FeishuSupplier(BaseSoundboxSupplier):
 
         logger.info(
             "Payload created for %s | Topic: %s | Payload: %s",
-            device_sn,
-            self.get_downlink_topic(device_sn),
-            payload,
+            device_sn, self.get_downlink_topic(device_sn), payload
         )
 
         return payload
-
 
 class SupplierFactory:
     """Factory resolving vendor strategy instances."""

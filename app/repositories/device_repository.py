@@ -17,7 +17,7 @@ class DeviceRepository:
                 """
                 SELECT device_id, device_name, COALESCE(supplier, 'hemi') AS supplier 
                 FROM devices 
-                WHERE (chat_id = $1 OR chat_id = $2) AND is_active = TRUE
+                WHERE (telegram_chat_id = $1 OR telegram_chat_id = $2) AND is_active = TRUE
                 """,
                 clean_chat, alt_chat,
             )

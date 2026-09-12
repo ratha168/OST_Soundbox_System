@@ -25,7 +25,7 @@ class AsyncMqttPublisher:
         self._username = username
         self._password = password
         self._on_message_callback = on_message_callback
-        self._listen_topics = listen_topics or ["/LLZN/#", "+/data", "pubmsg/#"]
+        self._listen_topics = listen_topics or ["/LLZN/#","XHKX8L740B/#", "+/data", "pubmsg/#"]
 
         self.client_id = f"ost_soundbox_gateway_{int(time.time() * 1000)}"
         
