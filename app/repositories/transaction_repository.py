@@ -22,7 +22,7 @@ class TransactionRepository:
                 await conn.execute(
                     """
                     INSERT INTO transactions (
-                        device_id, txid, telegram_chat_id, amount, currency, raw_payload, 
+                        device_id, txid, chat_id, amount, currency, raw_payload, 
                         device_ack, ack_status, ack_at, created_at
                     )
                     VALUES (

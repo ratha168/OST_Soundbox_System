@@ -15,7 +15,11 @@ class DeviceRepository:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT device_id, device_name, COALESCE(supplier, 'hemi') AS supplier 
+                SELECT device_id, 
+                CASE 
+                    WHEN supplier_id = 1 THEN 'Feishu' 
+                    ELSE 'Hemi' 
+                END AS supplier
                 FROM devices 
                 WHERE (telegram_chat_id = $1 OR telegram_chat_id = $2) AND is_active = TRUE
                 """,
@@ -27,7 +31,11 @@ class DeviceRepository:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT device_id, device_name, khqr_data, shop_name, merchant_id, COALESCE(supplier, 'hemi') as supplier
+                SELECT device_id, khqr_data, shop_name, merchant_id, 
+                CASE 
+                    WHEN supplier_id = 1 THEN 'Feishu' 
+                    ELSE 'Hemi' 
+                END AS supplier
                 FROM devices 
                 WHERE device_id = $1 AND is_active = TRUE
                 """,
