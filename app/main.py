@@ -115,14 +115,14 @@ async def unified_telegram_webhook(request: Request):
             return {"status": "ignored", "reason": "Not recognized as bank pattern"}
 
         # ២. ពិនិត្យស្ទួនតាមរយៈ Redis (Atomic SETNX)
-        if await container.dedup_service.is_duplicate(tx.txid):
+        if container.dedup_service.is_duplicate(tx.txid):
             logger.warning(f"🛑 Duplicate TxID Ignored: {tx.txid}")
             return {"status": "ignored", "reason": "Duplicate transaction ID"}
 
         # ៣. Broadcast ទៅកាន់ Speaker តាម Protocol (HEMI / Feishu)
         sent = await container.broadcast_service.broadcast(tx, chat_id, raw_text=raw_text)
         if not sent:
-            await container.dedup_service.release(tx.txid)
+            container.dedup_service.release(tx.txid)
             return {"status": "ignored", "reason": "Broadcast bypassed (no active devices/offline)"}
 
         return {
