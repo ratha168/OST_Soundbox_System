@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 import httpx
 import qrcode
 from telethon import TelegramClient, events
-from telethon.tl.types import MessageActionChatAddUser, MessageActionChatJoinedByLink
 from app.core.config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s")
@@ -98,26 +97,33 @@ class UserbotManager:
         @self.client.on(events.ChatAction)
         async def on_action(event):
             chat_id = str(event.chat_id)
+            # Trigger if a new user joins, or if someone was added
             if event.user_added or event.user_joined:
                 if event.user_id == self._me.id or event.added_by:
                     await self.qr_service.send_welcome(self.client, event, chat_id)
 
-        @self.client.on(events.NewMessage(incoming=None, outgoing=None))
+        @self.client.on(events.NewMessage)
         async def on_message(event):
-            chat_id = str(event.chat_id)
-            text = (event.message.message or "").strip()
-
-            if isinstance(event.message.action, (MessageActionChatAddUser, MessageActionChatJoinedByLink)):
-                await self.qr_service.send_welcome(self.client, event, chat_id)
+            # 1. Ignore service messages (handled by ChatAction above)
+            if event.message.action:
                 return
 
+            text = (event.message.message or "").strip()
+            if not text:
+                return
+
+            chat_id = str(event.chat_id)
+            
+            # 2. Check for setup commands
             if text.lower() in self.SETUP_COMMANDS:
                 await self.qr_service.send_welcome(self.client, event, chat_id)
                 return
 
-            if not text:
+            # 3. Ignore the bot's own outgoing messages to prevent looping
+            if event.out and event.sender_id == self._me.id:
                 return
 
+            # 4. Forward standard text messages
             sender = await event.get_sender()
             payload = {
                 "telegram_chat_id": chat_id,
@@ -126,7 +132,9 @@ class UserbotManager:
                 "username": getattr(sender, "username", None),
                 "full_name": f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip(),
             }
-            await self.forwarder.forward(payload)
+            
+            # Use create_task for non-blocking "fire and forget" forwarding
+            asyncio.create_task(self.forwarder.forward(payload))
 
     async def run(self):
         await self.forwarder.start()

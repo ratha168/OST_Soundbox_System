@@ -21,6 +21,12 @@ class BaseSoundboxSupplier(ABC):
         """Constructs vendor-compliant JSON voice payload."""
         pass
 
+    @abstractmethod
+    def build_get_info_payload(self) -> Dict[str, Any]:
+        """Constructs vendor-compliant JSON payload to request device telemetry."""
+        pass
+
+
 class HemiSupplier(BaseSoundboxSupplier):
     """Strategy implementation for HEMI Cloud Speakers."""
 
@@ -43,6 +49,8 @@ class HemiSupplier(BaseSoundboxSupplier):
                 "currency_type": curr,
             },
         }
+    def build_get_info_payload(self) -> Dict[str, Any]:
+        return {"cmd": "getinfo"}
 
 class FeishuSupplier(BaseSoundboxSupplier):
     """
@@ -149,7 +157,7 @@ class FeishuSupplier(BaseSoundboxSupplier):
         curr = currency.strip().upper()
 
         try:
-            val = float(amount)
+            val = max(0.0, float(amount)) # Guard against negatives
         except (ValueError, TypeError):
             logger.error("Invalid amount provided: %s. Defaulting to 0.", amount)
             val = 0.0
@@ -158,10 +166,11 @@ class FeishuSupplier(BaseSoundboxSupplier):
             dollars = int(val)
             cents = int(round((val - dollars) * 100))
 
-            # អានចំនួនដុល្លារ
-            codes.extend(self._parse_khmer_integer(dollars))
-            codes.append(self.CODE_CURRENCY_USD)
-
+            # Only pronounce dollars if there are dollars, OR if the total is exactly 0
+            if dollars > 0 or (dollars == 0 and cents == 0):
+                codes.extend(self._parse_khmer_integer(dollars))
+                codes.append(self.CODE_CURRENCY_USD)
+          
             # បើមានលុយកាក់ (Cents)
             if cents > 0:
                 codes.extend(self._parse_khmer_integer(cents))
@@ -189,6 +198,10 @@ class FeishuSupplier(BaseSoundboxSupplier):
         )
 
         return payload
+
+    def build_get_info_payload(self) -> Dict[str, Any]:
+        """ផ្ញើ Data getinfo ទៅ Soundbox ដើម្បីទាញយកទិន្នន័យ battery, signal, និង status"""
+        return {"cmd": "getinfo"}
 
 class SupplierFactory:
     """Factory resolving vendor strategy instances."""

@@ -53,7 +53,7 @@ class BaseBankExtractor(ABC):
             currency=currency,
             payer=str(data.get("payer", "")).strip(),
         )
-
+    
 
 class ABAPayWayExtractor(BaseBankExtractor):
     def __init__(self):

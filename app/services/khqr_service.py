@@ -1,5 +1,6 @@
 import logging
 import time
+import uuid
 from typing import Any, Dict
 from app.infrastructure.mqtt_client import AsyncMqttPublisher
 from app.repositories.device_repository import DeviceRepository
@@ -29,7 +30,7 @@ class KhqrService:
         shop_name = device["shop_name"] or device["device_name"] or "Scan to Pay"
         merchant_display_id = f"ID: {device['merchant_id']}" if device["merchant_id"] else f"ID: {device_sn}"
         topic = f"/LLZN/{device_sn}"
-        unique_msg_id = str(int(time.time() * 1000))[-10:]
+        unique_msg_id = uuid.uuid4().hex[:10]  # Guaranteed collision-free ID
 
         payload = {
             "message_id": unique_msg_id,

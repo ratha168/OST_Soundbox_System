@@ -1,5 +1,6 @@
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 from app.domain.models import Transaction
 from app.domain.suppliers import SupplierFactory
@@ -32,7 +33,7 @@ class BroadcastService:
             return None
 
         primary_device_id = devices[0]["device_id"]
-        unique_msg_id = str(int(time.time() * 1000))[-10:]
+        unique_msg_id = uuid.uuid4().hex[:10]
 
         inserted = await self._tx_repo.create_transaction(
             device_id=primary_device_id,

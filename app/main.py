@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import secrets
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -21,15 +22,17 @@ logger = logging.getLogger("SoundboxGateway")
 
 
 async def mqtt_queue_worker():
+    """Consumes incoming MQTT telemetry efficiently without polling."""
     while True:
         try:
-            if not container.mqtt_incoming_queue.empty():
-                topic, data = container.mqtt_incoming_queue.get_nowait()
+            # Awaits efficiently without burning CPU cycles
+            topic, data = await container.mqtt_incoming_queue.get()
+            try:
                 await container.telemetry_service.handle_packet(topic, data)
+            finally:
                 container.mqtt_incoming_queue.task_done()
-            else:
-                await asyncio.sleep(0.05)
         except asyncio.CancelledError:
+            logger.info("MQTT Queue Worker cancelled. Shutting down...")
             break
         except Exception as e:
             logger.error(f"MQTT Consumer Exception: {e}\n{traceback.format_exc()}")
@@ -112,14 +115,14 @@ async def unified_telegram_webhook(request: Request):
             return {"status": "ignored", "reason": "Not recognized as bank pattern"}
 
         # ២. ពិនិត្យស្ទួនតាមរយៈ Redis (Atomic SETNX)
-        if container.dedup_service.is_duplicate(tx.txid):
+        if await container.dedup_service.is_duplicate(tx.txid):
             logger.warning(f"🛑 Duplicate TxID Ignored: {tx.txid}")
             return {"status": "ignored", "reason": "Duplicate transaction ID"}
 
         # ៣. Broadcast ទៅកាន់ Speaker តាម Protocol (HEMI / Feishu)
         sent = await container.broadcast_service.broadcast(tx, chat_id, raw_text=raw_text)
         if not sent:
-            container.dedup_service.release(tx.txid)
+            await container.dedup_service.release(tx.txid)
             return {"status": "ignored", "reason": "Broadcast bypassed (no active devices/offline)"}
 
         return {
@@ -140,7 +143,8 @@ async def api_push_static_khqr(
     device_sn: str,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-    if x_api_key != settings.api_secret_key:
+    # Secure, constant-time API key comparison
+    if not x_api_key or not secrets.compare_digest(x_api_key, settings.api_secret_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
 
     result = await container.khqr_service.sync_static_khqr(device_sn)

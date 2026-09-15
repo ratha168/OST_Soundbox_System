@@ -26,7 +26,7 @@ class TransactionRepository:
                         device_ack, ack_status, ack_at, created_at
                     )
                     VALUES (
-                        $1, $2, $3, $4, $5, $6, TRUE, $7, 
+                        $1, $2, $3, $4, $5, $6, FALSE, $7, 
                         (NOW() AT TIME ZONE 'Asia/Phnom_Penh'), 
                         (NOW() AT TIME ZONE 'Asia/Phnom_Penh')
                     )
