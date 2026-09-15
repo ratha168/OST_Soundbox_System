@@ -49,7 +49,7 @@ class TelemetryService:
         raw_sn = data.get("device_sn") or data.get("sn")
         if not raw_sn:
             topic_clean = topic.strip("/").split("/")[0]
-            raw_sn = topic_clean if topic_clean not in ["pubmsg", "LLZN", "data", "up"] else None
+            raw_sn = topic_clean if topic_clean not in ["pubmsg", "LLZN", "data", "up", "getinfo"] else None
 
         device_sn = str(raw_sn).strip() if raw_sn else "unknown"
         packet_type = str(data.get("packet_type", "")).lower()

@@ -104,6 +104,10 @@ class UserbotManager:
 
         @self.client.on(events.NewMessage)
         async def on_message(event):
+            # បន្ថែម 2 បន្ទាត់នេះ ដើម្បីឱ្យវា Print ប្រាប់រាល់ពេលមានអ្នកឆាតចូល
+            text = (event.message.message or "").strip()
+            logger.info(f"📩 ទទួលបានសារពី Chat ID: {event.chat_id} | អត្ថបទ: {text}")
+            
             # 1. Ignore service messages (handled by ChatAction above)
             if event.message.action:
                 return
