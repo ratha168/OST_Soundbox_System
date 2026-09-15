@@ -50,11 +50,11 @@ class DeviceRepository:
             await conn.execute(
                 """
                 INSERT INTO devices (
-                    device_id, device_name, is_active, battery, signal, 
+                    device_id, is_active, battery, signal, 
                     version_4g, version_wifi, last_online, created_at, updated_at
                 )
                 VALUES (
-                    $1, $2, TRUE, $3, $4, $5, $6, 
+                    $1, TRUE, $2, $3, $4, $5, 
                     (NOW() AT TIME ZONE 'Asia/Phnom_Penh'), 
                     (NOW() AT TIME ZONE 'Asia/Phnom_Penh'), 
                     (NOW() AT TIME ZONE 'Asia/Phnom_Penh')
@@ -67,5 +67,5 @@ class DeviceRepository:
                     last_online = (NOW() AT TIME ZONE 'Asia/Phnom_Penh'),
                     updated_at = (NOW() AT TIME ZONE 'Asia/Phnom_Penh')
                 """,
-                device_sn, f"DEV_{device_sn}", battery, signal, fw_4g, fw_wifi,
+                device_sn, battery, signal, fw_4g, fw_wifi,
             )

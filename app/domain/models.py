@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional,Union
+from pydantic import BaseModel, Field, field_validator
 
 @dataclass(frozen=True)
 class Transaction:
@@ -17,38 +17,33 @@ class Transaction:
 
 
 class DeviceTelemetry(BaseModel):
-    """Pydantic model for incoming 'getinfo' device telemetry (4G & WiFi)."""
-    cmd: str
+    cmd: str = "getinfo"
     sn: str
-    
-    # Shared Fields
-    volume: Optional[str] = None
-    batt: Optional[int] = None
-    lang: Optional[int] = None
-    verno: Optional[str] = None
+    volume: Optional[Union[str, int]] = None
     vlver: Optional[str] = None
-    
-    # 4G Specific Fields
+    lang: Optional[Union[str, int]] = None
+    batt: Optional[Union[str, int]] = None
+    verno: Optional[str] = None
+
+    # សម្រាប់ម៉ូដែល 4G
     imei: Optional[str] = None
     imsi: Optional[str] = None
     iccid: Optional[str] = None
-    signal: Optional[int] = None
-    
-    # WiFi Specific Fields
-    adc: Optional[int] = None
+    signal: Optional[Union[str, int]] = None
+
+    # សម្រាប់ម៉ូដែល Wi-Fi
+    adc: Optional[Union[str, int]] = None
     ssid: Optional[str] = None
     mac: Optional[str] = None
 
     @property
-    def battery_percentage(self) -> str:
-        """Converts millivolts to an estimated percentage string."""
-        if not self.batt:
-            return "0%"
-        # Based on docs: > 4100mV is full, < 3400mV shuts down
-        if self.batt >= 4100:
-            return "100%"
-        elif self.batt <= 3400:
-            return "0%"
-        else:
-            pct = int(((self.batt - 3400) / (4100 - 3400)) * 100)
-            return f"{pct}%"
+    def battery_percentage(self) -> Optional[int]:
+        if self.batt is None:
+            return None
+        try:
+            mv = float(self.batt)
+            # តាម Spec: 4100mV = 100%, 3400mV = 0%
+            pct = int(round(((mv - 3400) / (4100 - 3400)) * 100))
+            return max(0, min(100, pct))
+        except (ValueError, TypeError):
+            return None
