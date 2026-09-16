@@ -1,36 +1,45 @@
 import logging
-import redis
-from app.core.config import settings
+from typing import Optional
+import redis.asyncio as aioredis
 
 logger = logging.getLogger("DedupService")
 
 
 class RedisDedupService:
-    """Atomic transaction deduplication using Redis SETNX."""
+    """Prevents duplicate bank webhook notifications using Redis Atomic SETNX."""
 
-    def __init__(self):
-        self._pool = redis.ConnectionPool(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            db=0,
-            decode_responses=True,
-            socket_timeout=3.0,
-            socket_connect_timeout=3.0,
-        )
-        self._redis = redis.Redis(connection_pool=self._pool)
+    def __init__(self, redis_client: aioredis.Redis, ttl_seconds: int = 86400):
+        self._redis = redis_client
+        self._ttl = ttl_seconds
 
-    def is_duplicate(self, txid: str, ttl_seconds: int = 86400) -> bool:
-        if not txid:
+    async def is_duplicate(self, txid: Optional[str]) -> bool:
+        if not txid or not str(txid).strip():
+            logger.warning("Empty TxID provided to dedup check; bypassing duplicate filter.")
             return False
+
+        clean_txid = str(txid).strip()
+        key = f"dedup:tx:{clean_txid}"
         try:
-            is_new = self._redis.set(f"tx:{txid.strip()}", "PROCESSED", nx=True, ex=ttl_seconds)
+            # SETNX ធានាថា key មិនស្ទួន និងកំណត់ TTL ក្នុង atomic operation តែមួយ
+            is_new = await self._redis.set(key, "1", ex=self._ttl, nx=True)
             return not bool(is_new)
-        except redis.RedisError as e:
-            logger.error(f"Redis error checking txid '{txid}': {e}")
+        except Exception as e:
+            logger.error("Redis dedup check error for TxID %s: %s", clean_txid, e)
             return False
 
-    def release(self, txid: str) -> None:
+    async def release(self, txid: Optional[str]) -> None:
+        """លុប key ចេញពី Redis វិញ ក្នុងករណី broadcast បរាជ័យ ដើម្បីអនុញ្ញាតឱ្យ retry។"""
+        if not txid or not str(txid).strip():
+            return
+
+        clean_txid = str(txid).strip()
+        key = f"dedup:tx:{clean_txid}"
         try:
-            self._redis.delete(f"tx:{txid.strip()}")
-        except redis.RedisError:
-            pass
+            await self._redis.delete(key)
+            logger.info("Released dedup lock for TxID: %s", clean_txid)
+        except Exception as e:
+            logger.error("Failed to release Redis key for TxID %s: %s", clean_txid, e)
+
+
+# Backward-compatible alias
+DedupService = RedisDedupService

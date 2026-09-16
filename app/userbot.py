@@ -8,9 +8,14 @@ import qrcode
 from telethon import TelegramClient, events
 from app.core.config import settings
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s")
+# កំណត់ logging ជាសកលជាមួយ force=True សម្រាប់ដំណើរការ userbot ដាច់ដោយឡែក
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
+)
 logger = logging.getLogger("UserbotEngine")
-
 
 class WelcomeQrService:
     def __init__(self, throttle_window: float = 5.0):
@@ -55,9 +60,9 @@ class WelcomeQrService:
                 await peer.respond(caption, file=qr_file, parse_mode="md")
             else:
                 await client.send_file(peer, file=qr_file, caption=caption, parse_mode="md")
-            logger.info(f"Welcome QR dispatched to chat {chat_id}")
+            logger.info("Welcome QR dispatched to chat %s", chat_id)
         except Exception as e:
-            logger.error(f"Failed to send welcome QR: {e}")
+            logger.error("Failed to send welcome QR: %s", e)
 
 
 class ForwardingClient:
@@ -78,9 +83,15 @@ class ForwardingClient:
             return False
         try:
             res = await self._client.post(self._url, json=payload, headers=self._headers)
-            return res.status_code == 200
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success":
+                    logger.info("Forwarded to Gateway: TxID %s | Devices: %s", data.get("txid"), data.get("broadcast_to"))
+                return True
+            logger.warning("Gateway returned HTTP %s for chat %s", res.status_code, payload.get("telegram_chat_id"))
+            return False
         except Exception as e:
-            logger.error(f"Forwarding exception: {e}")
+            logger.error("Forwarding exception: %s", e)
             return False
 
 
@@ -97,37 +108,31 @@ class UserbotManager:
         @self.client.on(events.ChatAction)
         async def on_action(event):
             chat_id = str(event.chat_id)
-            # Trigger if a new user joins, or if someone was added
             if event.user_added or event.user_joined:
-                if event.user_id == self._me.id or event.added_by:
+                if (self._me and event.user_id == self._me.id) or event.added_by:
                     await self.qr_service.send_welcome(self.client, event, chat_id)
 
         @self.client.on(events.NewMessage)
         async def on_message(event):
-            # បន្ថែម 2 បន្ទាត់នេះ ដើម្បីឱ្យវា Print ប្រាប់រាល់ពេលមានអ្នកឆាតចូល
             text = (event.message.message or "").strip()
-            logger.info(f"📩 ទទួលបានសារពី Chat ID: {event.chat_id} | អត្ថបទ: {text}")
             
-            # 1. Ignore service messages (handled by ChatAction above)
-            if event.message.action:
-                return
-
-            text = (event.message.message or "").strip()
-            if not text:
+            # 1. រំលង Service messages (Handled by ChatAction)
+            if event.message.action or not text:
                 return
 
             chat_id = str(event.chat_id)
-            
-            # 2. Check for setup commands
+            logger.info("📩 ទទួលបានសារពី Chat ID: %s | អត្ថបទ: %s", chat_id, text)
+
+            # 2. ពិនិត្យពាក្យបញ្ជា Setup / QR code
             if text.lower() in self.SETUP_COMMANDS:
                 await self.qr_service.send_welcome(self.client, event, chat_id)
                 return
 
-            # 3. Ignore the bot's own outgoing messages to prevent looping
-            if event.out and event.sender_id == self._me.id:
+            # 3. រំលងសារផ្ទាល់ខ្លួនរបស់ Bot ដើម្បីកុំឱ្យ Loop
+            if event.out and self._me and event.sender_id == self._me.id:
                 return
 
-            # 4. Forward standard text messages
+            # 4. បញ្ជូនសារទូទាត់ប្រាក់ទៅកាន់ Gateway
             sender = await event.get_sender()
             payload = {
                 "telegram_chat_id": chat_id,
@@ -136,15 +141,14 @@ class UserbotManager:
                 "username": getattr(sender, "username", None),
                 "full_name": f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip(),
             }
-            
-            # Use create_task for non-blocking "fire and forget" forwarding
+
             asyncio.create_task(self.forwarder.forward(payload))
 
     async def run(self):
         await self.forwarder.start()
         await self.client.start()
         self._me = await self.client.get_me()
-        logger.info(f"Connected as @{self._me.username or self._me.id} ({self._me.first_name})")
+        logger.info("Connected as @%s (%s)", self._me.username or self._me.id, self._me.first_name)
         self._setup_handlers()
         try:
             await self.client.run_until_disconnected()
@@ -154,4 +158,7 @@ class UserbotManager:
 
 if __name__ == "__main__":
     bot = UserbotManager()
-    asyncio.run(bot.run())
+    try:
+        asyncio.run(bot.run())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Userbot stopped by admin.")

@@ -1,101 +1,60 @@
+import logging
 import re
-from abc import ABC
-from decimal import Decimal, InvalidOperation
-from typing import List, Optional, Pattern
-from app.domain.models import Transaction
+from typing import Optional
+from app.domain.models import Currency, Transaction
 
-
-class TextCleaner:
-    ZERO_WIDTH_REGEX: Pattern = re.compile(r"[\u200B-\u200D\uFEFF\u00A0]")
-
-    @classmethod
-    def clean(cls, text: Optional[str]) -> str:
-        if not text:
-            return ""
-        return " ".join(cls.ZERO_WIDTH_REGEX.sub(" ", text).split())
-
-
-class CurrencyNormalizer:
-    _MAPPING = {
-        "KHR": "KHR", "៛": "KHR", "រៀល": "KHR",
-        "USD": "USD", "$": "USD", "ដុល្លារ": "USD",
-    }
-
-    @classmethod
-    def normalize(cls, raw: Optional[str], default: str = "USD") -> str:
-        if not raw:
-            return default.upper()
-        return cls._MAPPING.get(raw.strip(), default.upper())
-
-
-class BaseBankExtractor(ABC):
-    def __init__(self, bank_name: str, regex_str: str, default_currency: str = "USD"):
-        self.bank_name = bank_name
-        self.pattern = re.compile(regex_str, re.IGNORECASE | re.DOTALL)
-        self.default_currency = default_currency
-
-    def extract(self, text: str) -> Optional[Transaction]:
-        match = self.pattern.search(text)
-        if not match:
-            return None
-        data = match.groupdict()
-        try:
-            amount_clean = data["amount"].replace(",", "").strip()
-            amount = float(Decimal(amount_clean))
-        except (InvalidOperation, KeyError, ValueError):
-            return None
-
-        currency = CurrencyNormalizer.normalize(data.get("currency"), self.default_currency)
-        return Transaction(
-            bank=self.bank_name,
-            txid=str(data.get("txid", "")).strip(),
-            amount=amount,
-            currency=currency,
-            payer=str(data.get("payer", "")).strip(),
-        )
-    
-
-class ABAPayWayExtractor(BaseBankExtractor):
-    def __init__(self):
-        super().__init__(
-            bank_name="ABA_PayWay",
-            regex_str=r"(?P<currency>៛|\$|KHR|USD)?\s*(?P<amount>[\d,]+(?:\.\d+)?)\s+paid\s+by\s+(?P<payer>.+?)(?:\s*\(\*\d+\))?\s+on\s+.*?Trx\.\s*ID:\s*(?P<txid>\w+)",
-            default_currency="USD",
-        )
-
-
-class CanadiaCMCExtractor(BaseBankExtractor):
-    def __init__(self):
-        super().__init__(
-            bank_name="CMC_KHQR",
-            regex_str=r"(?P<currency>KHR|USD)\s+(?P<amount>[\d,]+(?:\.\d+)?)\s+is\s+paid\s+by\s+.*?\s+for\s+purchase\s+(?P<txid>[a-zA-Z0-9]+),\s*from\s+(?P<payer>.+?),\s*at\s+",
-            default_currency="USD",
-        )
-
-
-class AcledaKhmerExtractor(BaseBankExtractor):
-    def __init__(self):
-        super().__init__(
-            bank_name="ACLEDA",
-            regex_str=r"បានទទួល\s+(?P<amount>[\d,]+(?:\.\d+)?)\s+(?P<currency>រៀល|ដុល្លារ|\$|USD|KHR)\s+ពី\s+(?P<payer>.+?),\s*ថ្ងៃទី.+?,\s*លេខយោង\s+(?P<txid>\w+)",
-            default_currency="KHR",
-        )
-
+logger = logging.getLogger("BankParser")
 
 class BankNotificationParser:
-    _EXTRACTORS: List[BaseBankExtractor] = [
-        ABAPayWayExtractor(),
-        CanadiaCMCExtractor(),
-        AcledaKhmerExtractor(),
-    ]
+    """Parses incoming bank transaction text (ABA, ACLEDA, Canadia, etc.)."""
+
+    # សម្គាល់ ABA Bank: e.g. "You have received $ 10.50 from ... Tran-ID: 178951507229433"
+    ABA_USD_PATTERN = re.compile(
+        r"(?:received|\+)\s*\$\s*([\d,]+(?:\.\d{1,2})?).*?(?:Tran(?:saction)?[- ]?ID|Ref(?:\.|erence)?|APV)[:\s]*([A-Za-z0-9]+)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    ABA_KHR_PATTERN = re.compile(
+        r"(?:received|\+)\s*([\d,]+)\s*(?:KHR|៛|Riel).*?(?:Tran(?:saction)?[- ]?ID|Ref(?:\.|erence)?|APV)[:\s]*([A-Za-z0-9]+)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    # សម្គាល់ ACLEDA Bank: e.g. "ACLEDA: You received USD 5.00 ... Txn ID: 987654321"
+    ACLEDA_PATTERN = re.compile(
+        r"(?:received|recieved|cr:)\s*(USD|KHR)\s*([\d,]+(?:\.\d{1,2})?).*?(?:Txn|Trans|ID)[:\s]*([A-Za-z0-9]+)",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     @classmethod
-    def parse(cls, raw_text: Optional[str]) -> Optional[Transaction]:
-        cleaned = TextCleaner.clean(raw_text)
-        if not cleaned:
+    def parse(cls, text: str) -> Optional[Transaction]:
+        if not text:
             return None
-        for extractor in cls._EXTRACTORS:
-            result = extractor.extract(cleaned)
-            if result:
-                return result
+
+        clean_text = text.replace("\xa0", " ").strip()
+
+        # 1. Check ABA USD
+        match = cls.ABA_USD_PATTERN.search(clean_text)
+        if match:
+            raw_amt, txid = match.groups()
+            amount = float(raw_amt.replace(",", ""))
+            logger.info("Parsed ABA USD Transaction | Amount: %s | TxID: %s", amount, txid)
+            return Transaction(txid=txid.strip(), amount=amount, currency=Currency.USD)
+
+        # 2. Check ABA KHR
+        match = cls.ABA_KHR_PATTERN.search(clean_text)
+        if match:
+            raw_amt, txid = match.groups()
+            amount = float(raw_amt.replace(",", ""))
+            logger.info("Parsed ABA KHR Transaction | Amount: %s | TxID: %s", amount, txid)
+            return Transaction(txid=txid.strip(), amount=amount, currency=Currency.KHR)
+
+        # 3. Check ACLEDA / General Format
+        match = cls.ACLEDA_PATTERN.search(clean_text)
+        if match:
+            curr_str, raw_amt, txid = match.groups()
+            amount = float(raw_amt.replace(",", ""))
+            currency = Currency.USD if curr_str.upper() == "USD" else Currency.KHR
+            logger.info("Parsed ACLEDA Transaction | Currency: %s | Amount: %s | TxID: %s", currency.value, amount, txid)
+            return Transaction(txid=txid.strip(), amount=amount, currency=currency)
+
+        logger.debug("Raw text does not match any known banking pattern: %s", clean_text[:60])
         return None

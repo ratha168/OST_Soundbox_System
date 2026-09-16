@@ -3,7 +3,6 @@ import logging
 import re
 from typing import Any, Dict, Optional, Union
 from pydantic import ValidationError
-
 from app.domain.models import DeviceTelemetry
 from app.repositories.device_repository import DeviceRepository
 from app.repositories.transaction_repository import TransactionRepository
@@ -27,20 +26,38 @@ class TelemetryService:
     @staticmethod
     def _extract_sn_from_topic(topic: str) -> Optional[str]:
         """
-        ទាញយក SN ពី Topic ទម្រង់ផ្សេងៗដូចជា:
+        ទាញយក SN ចេញពីទម្រង់ Topic ផ្សេងៗ៖
         - pubmsg/BOX4G20250806000002
-        - XHKX8L74OB/BOX4G20250806000002/data
-        - /LLZN/SN123456
+        - XHKX8L740B/0000002/data
+        - sub/MB3W2511017601YYY
+        - /LLZN/0000002/up
         """
         parts = [p for p in topic.strip("/").split("/") if p]
-        ignored = {"pubmsg", "llzn", "data", "up", "getinfo", "xhkx8l740b"}
+        ignored = {"pubmsg", "llzn", "data", "up", "getinfo", "set", "cmd", "sub", "pub", "down"}
 
         for part in parts:
             clean = re.sub(r"[^A-Za-z0-9_-]", "", part)
-            # មិនយក Product ID (XHKX8L740B) ឬពាក្យក្នុង ignored ធ្វើជា SN ឡើយ
-            if clean.lower() not in ignored and not clean.upper().startswith("XHKX"):
+            # បើជា Key Model (មានអក្សរ និងលេខលាយគ្នាវែង) ឬពាក្យបញ្ជា ត្រូវរំលង
+            if clean.lower() not in ignored and not clean.upper().startswith("XHKX8L"):
                 return clean
         return None
+
+    @staticmethod
+    def _calc_battery_percentage(raw_batt: Any) -> str:
+        """
+        បម្លែងតម្លៃថ្មពី Millivolt (mV) ទៅជាភាគរយ % (ផ្អែកលើថ្ម Li-ion 3.4V - 4.2V)
+        """
+        if raw_batt is None or raw_batt == "":
+            return ""
+        try:
+            val = float(raw_batt)
+            if val > 100:
+                pct = max(0, min(100, int(round(((val - 3400) / 800) * 100))))
+                return f"{pct}%"
+            pct = max(0, min(100, int(round(val))))
+            return f"{pct}%"
+        except (ValueError, TypeError):
+            return str(raw_batt)
 
     @staticmethod
     def _format_signal(signal_val: Any) -> str:
@@ -49,7 +66,6 @@ class TelemetryService:
             return ""
         try:
             val = int(signal_val)
-            # បើសិនជាតម្លៃ CSQ 4G (0 ដល់ 31)
             if 0 <= val <= 31:
                 if val >= 20:
                     return f"Excellent (CSQ: {val})"
@@ -58,8 +74,7 @@ class TelemetryService:
                 elif val >= 10:
                     return f"Fair (CSQ: {val})"
                 return f"Poor (CSQ: {val})"
-            
-            # បើសិនជាតម្លៃ WiFi RSSI (dBm អវិជ្ជមាន)
+
             if val >= -65:
                 return f"Excellent ({val} dBm)"
             elif val >= -75:
@@ -85,12 +100,11 @@ class TelemetryService:
             logger.error("Unsupported payload type on topic %s: %s", topic, type(raw_payload))
             return
 
-        # ទាញយក Device SN ពី Payload ឬទាញចេញពី Topic
-        raw_sn = data.get("device_sn") or data.get("sn")
-        if not raw_sn:
-            raw_sn = self._extract_sn_from_topic(topic)
+        # ទាញយក SN ពី Payload ឬ Topic
+        topic_sn = self._extract_sn_from_topic(topic)
+        payload_sn = data.get("device_sn") or data.get("sn")
+        device_sn = str(payload_sn or topic_sn or "unknown").strip()
 
-        device_sn = str(raw_sn).strip() if raw_sn else "unknown"
         cmd = str(data.get("cmd", "")).strip().lower()
         packet_type = str(data.get("packet_type", "")).strip().lower()
         content = data.get("content", {})
@@ -99,80 +113,114 @@ class TelemetryService:
         # ========================================================
         # 1. TELEMETRY: ឆ្លើយតបពី getinfo (Feishu 4G/WiFi)
         # ========================================================
-        # 1. Telemetry Updates (ឆ្លើយតបពី getinfo របស់ Feishu)
         if cmd == "getinfo":
-            # បើគ្មាន batt, volume, verno ទេ មានន័យថាជា Command ដែល Server បាញ់ចេញទៅ
-            # ត្រូវ return ចោលភ្លាម កុំឱ្យកត់ត្រាចូល DB ដោយទទេស្អាត
             if "batt" not in data and "volume" not in data and "verno" not in data:
                 return
 
             try:
-                if "sn" not in data and device_sn != "unknown":
-                    data["sn"] = device_sn
+                imei = str(data.get("imei") or "").strip()
+                imsi = str(data.get("imsi") or "").strip()
+                iccid = str(data.get("iccid") or "").strip()
+                vlver = str(data.get("vlver") or "").strip()
+                adc = str(data.get("adc") or "").strip()
+                ssid = str(data.get("ssid") or "").strip()
+                mac = str(data.get("mac") or "").strip()
+                verno = str(data.get("verno") or "").strip()
+                netmodel = str(data.get("netmodel", "")).upper()
 
-                telemetry = DeviceTelemetry(**data)
-                fw_4g = telemetry.verno if telemetry.imei else ""
-                fw_wifi = telemetry.verno if telemetry.mac else ""
-                sig_str = self._format_signal(telemetry.signal)
-                bat_val = f"{telemetry.battery_percentage}%" if telemetry.battery_percentage is not None else ""
+                volume = int(data["volume"]) if data.get("volume") is not None and str(data["volume"]).isdigit() else None
+                lang = int(data["lang"]) if data.get("lang") is not None and str(data["lang"]).isdigit() else None
+                batt_mv = int(data["batt"]) if data.get("batt") is not None and str(data["batt"]).isdigit() else None
+
+                bat_val = self._calc_battery_percentage(batt_mv)
+                sig_str = self._format_signal(data.get("signal"))
+
+                fw_4g = verno if imei or netmodel != "WIFI" else ""
+                fw_wifi = verno if mac or netmodel == "WIFI" else ""
 
                 await self._device_repo.upsert_telemetry(
-                    device_sn=telemetry.sn,
+                    device_sn=device_sn,
                     battery=bat_val,
                     signal=sig_str,
                     fw_4g=fw_4g,
                     fw_wifi=fw_wifi,
+                    imei=imei,
+                    imsi=imsi,
+                    iccid=iccid,
+                    volume=volume,
+                    vlver=vlver,
+                    lang=lang,
+                    batt_mv=batt_mv,
+                    adc=adc,
+                    ssid=ssid,
+                    mac=mac,
                 )
                 logger.info(
-                    "✅ [GETINFO OK] SN: %s | Batt: %s (%smV) | Sig: %s | FW: %s",
-                    telemetry.sn, bat_val, telemetry.batt, sig_str, telemetry.verno
+                    "✅ [GETINFO SYNC] SN: %s | IMEI: %s | Batt: %s (%smV) | Vol: %s | AudioVer: %s | Sig: %s",
+                    device_sn, imei, bat_val, batt_mv, volume, vlver, sig_str
                 )
-            except ValidationError as e:
-                logger.error("Telemetry validation failed for %s: %s | Data: %s", device_sn, e, data)
             except Exception as ex:
-                logger.error("Failed to persist getinfo telemetry for %s: %s", device_sn, ex)
+                logger.error("Failed to persist getinfo telemetry for %s: %s", device_sn, ex, exc_info=True)
 
         # ========================================================
-        # 2. TELEMETRY: Boot Packets / Heartbeat (Hemi & Other devices)
+        # 2. PLAYBACK ACKNOWLEDGMENTS: បញ្ជាក់ការបន្លឺសំឡេងរួចរាល់
+        # (Feishu / Hemi គាំទ្រទាំង play_ack, broadcast_ack, voice_ack, result, status)
         # ========================================================
-        elif "device_info" in packet_type or "boot" in packet_type or "battery_percent" in content:
-            bat_pct = content.get("battery_percent")
-            if bat_pct is None and "batt" in data:
-                try:
-                    mv = float(data["batt"])
-                    bat_pct = max(0, min(100, int(round(((mv - 3400) / 700) * 100))))
-                except (ValueError, TypeError):
-                    bat_pct = None
-
-            battery_str = f"{bat_pct}%" if bat_pct is not None else ""
-            sig_raw = content.get("signal_value") or content.get("wifi_signal") or data.get("signal")
-            signal_str = self._format_signal(sig_raw)
-            fw_4g = str(content.get("4g_fw_version") or data.get("verno") or "")
-            fw_wifi = str(content.get("wifi_fw_version") or "")
-
-            await self._device_repo.upsert_telemetry(device_sn, battery_str, signal_str, fw_4g, fw_wifi)
-            logger.info("✅ [BOOT/TELEMETRY OK] SN: %s | Batt: %s | Sig: %s", device_sn, battery_str, signal_str)
-
-        # ========================================================
-        # 3. PLAYBACK ACKNOWLEDGMENTS: បញ្ជាក់ការបន្លឺសំឡេងរួចរាល់
-        # ========================================================
-        elif cmd in ("voice_ack", "ack", "payment_ack") or "status" in data or "response_status" in content:
+        elif (
+            cmd in ("voice_ack", "ack", "payment_ack", "play_ack", "broadcast_ack")
+            or "status" in data
+            or "result" in data
+            or "play_status" in data
+            or "response_status" in content
+        ):
             resp_status = (
-                content.get("response_status")
+                data.get("status")
+                or data.get("result")
+                or data.get("play_status")
+                or content.get("response_status")
                 or content.get("play_status")
-                or data.get("status")
                 or "success"
             )
             is_success = str(resp_status).lower() in ["success", "ok", "0", "true", "play_end", "finish"]
             status_text = "SPEAKER_PLAYED" if is_success else "FAILED"
 
-            matched_tx = self._correlation_registry.pop(f"{device_sn}:{msg_id}", None) if msg_id else None
+            matched_tx = None
+            if msg_id:
+                matched_tx = self._correlation_registry.pop(f"{device_sn}:{msg_id}", None)
+                if not matched_tx:
+                    # fallback រកតាម short SN ប្រសិនបើ device_sn ជា full SN
+                    short_sn = device_sn[-7:] if len(device_sn) >= 7 else device_sn
+                    matched_tx = self._correlation_registry.pop(f"{short_sn}:{msg_id}", None)
+
             if matched_tx:
                 await self._tx_repo.update_ack_by_txid(matched_tx["txid"], is_success, status_text)
                 logger.info("✅ [EXACT ACK] TxID: %s on SN: %s (Status: %s)", matched_tx["txid"], device_sn, status_text)
             else:
                 await self._tx_repo.update_fallback_ack(device_sn, is_success, status_text)
                 logger.info("ℹ️ [FALLBACK ACK] SN: %s (Status: %s)", device_sn, status_text)
+
+        # ========================================================
+        # 3. TELEMETRY: Boot Packets / Heartbeat (Hemi & Other Devices)
+        # ========================================================
+        elif "device_info" in packet_type or "boot" in packet_type or "battery_percent" in content:
+            raw_bat = content.get("battery_percent") or data.get("batt")
+            battery_str = self._calc_battery_percentage(raw_bat)
+
+            sig_raw = content.get("signal_value") or content.get("wifi_signal") or data.get("signal")
+            signal_str = self._format_signal(sig_raw)
+
+            fw_4g = str(content.get("4g_fw_version") or data.get("verno") or "")
+            fw_wifi = str(content.get("wifi_fw_version") or "")
+
+            await self._device_repo.upsert_telemetry(
+                device_sn=device_sn,
+                battery=battery_str,
+                signal=signal_str,
+                fw_4g=fw_4g,
+                fw_wifi=fw_wifi,
+                imei=str(data.get("imei") or "").strip(),
+            )
+            logger.info("✅ [BOOT/TELEMETRY OK] SN: %s | Batt: %s | Sig: %s", device_sn, battery_str, signal_str)
 
         else:
             logger.debug("Unhandled MQTT packet on %s: %s", topic, data)

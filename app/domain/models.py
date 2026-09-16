@@ -1,17 +1,44 @@
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional,Union
-from pydantic import BaseModel, Field, field_validator
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, Optional, Union
+from pydantic import BaseModel, Field
 
-@dataclass(frozen=True)
-class Transaction:
-    bank: str
+
+class AckStatus(str, Enum):
+    PENDING = "PENDING"
+    MQTT_DELIVERED = "MQTT_DELIVERED"
+    SPEAKER_PLAYED = "SPEAKER_PLAYED"
+    FAILED = "FAILED"
+    TIMEOUT = "PLAY_TIMEOUT"
+
+
+class Currency(str, Enum):
+    KHR = "KHR"
+    USD = "USD"
+
+
+class SupplierType(str, Enum):
+    FEISHU = "Feishu"
+    HEMI = "Hemi"
+
+
+class Transaction(BaseModel):
+    """Represents a financial payment notification mapped for soundbox dispatch."""
     txid: str
-    amount: float
-    currency: str
-    payer: str
+    amount: float = Field(gt=0, description="ចំនួនទឹកប្រាក់ត្រូវតែធំជាង 0")
+    currency: Currency = Currency.KHR
+    bank: Optional[str] = "Unknown"
+    payer: Optional[str] = None
+    merchant_id: Optional[int] = None
+    chat_id: Optional[str] = None
+    raw_payload: Optional[str] = None
+    ack_status: AckStatus = AckStatus.PENDING
+    is_played: bool = False
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
+        data = self.model_dump()
         data["bank_name"] = self.bank
         return data
 

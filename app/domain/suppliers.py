@@ -4,26 +4,24 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("SoundboxSuppliers")
+
 
 class BaseSoundboxSupplier(ABC):
     """Abstract Strategy interface for soundbox hardware vendors."""
 
     @abstractmethod
     def get_downlink_topic(self, device_sn: str) -> str:
-        """MQTT command topic to dispatch payment announcements."""
         pass
 
     @abstractmethod
     def build_payment_payload(
         self, device_sn: str, amount: float, currency: str, message_id: str
     ) -> Dict[str, Any]:
-        """Constructs vendor-compliant JSON voice payload."""
         pass
 
     @abstractmethod
     def build_get_info_payload(self) -> Dict[str, Any]:
-        """Constructs vendor-compliant JSON payload to request device telemetry."""
         pass
 
 
@@ -38,7 +36,7 @@ class HemiSupplier(BaseSoundboxSupplier):
         self, device_sn: str, amount: float, currency: str, message_id: str
     ) -> Dict[str, Any]:
         clean_sn = device_sn.strip()
-        curr = "USD" if currency.upper() == "USD" else "KHR"
+        curr = "USD" if str(currency).upper() == "USD" else "KHR"
         return {
             "message_id": message_id,
             "time_stamp": str(int(time.time())),
@@ -49,25 +47,27 @@ class HemiSupplier(BaseSoundboxSupplier):
                 "currency_type": curr,
             },
         }
+
     def build_get_info_payload(self) -> Dict[str, Any]:
         return {"cmd": "getinfo"}
 
+
 class FeishuSupplier(BaseSoundboxSupplier):
     """
-    Advanced Khmer & USD Voice Strategy for Feishu 4G Cloud Soundbox.
-    Audio Pack: audio_HEMI - Feishu MP3 sliced dictionary.
+    Advanced Khmer & USD Voice Strategy for Feishu 4G/WiFi Cloud Soundbox.
+    Slicing dictionary mapping according to minifs voice packs.
     """
 
-    PRODUCT_ID = "XHKX8L74OB"
+    PRODUCT_ID = "XHKX8L740B"
 
     # ក្រុមទី ១៖ សំឡេងប្រព័ន្ធ និង រូបិយប័ណ្ណ (000 - 009)
     CODE_PROMPT_RECEIVED = "000"  # ទទួលប្រាក់
     CODE_CURRENCY_USD    = "001"  # ដុល្លារ
     CODE_CURRENCY_KHR    = "002"  # រៀល
     CODE_CURRENCY_CENT   = "003"  # សេន
-    CODE_DOT             = "004"  # ក្បៀស / ចុច
+    CODE_DOT             = "004"  # ចុច
 
-    # ក្រុមទី ២៖ លេខរាយ 0 ដល់ 9 (010 - 019) -> [កែតម្រូវកុំឱ្យជាន់ជាមួយរូបិយប័ណ្ណ]
+    # ក្រុមទី ២៖ លេខរាយ 0 ដល់ 9 (010 - 019)
     DIGITS_MAP = {
         0: "010", 1: "011", 2: "012", 3: "013", 4: "014",
         5: "015", 6: "016", 7: "017", 8: "018", 9: "019"
@@ -93,10 +93,12 @@ class FeishuSupplier(BaseSoundboxSupplier):
     CODE_MILLION          = "104"  # លាន
 
     def get_downlink_topic(self, device_sn: str) -> str:
+        """Downlink topic ស្តង់ដារសម្រាប់ Feishu Firmware គឺ /down"""
         raw_sn = device_sn.strip()
         clean_sn = raw_sn.split("/")[-1].strip() if "/" in raw_sn else raw_sn
         clean_sn = re.sub(r"[^A-Za-z0-9]", "", clean_sn)
-        return f"{self.PRODUCT_ID}/{clean_sn}/data"
+        short_sn = clean_sn[-7:] if len(clean_sn) >= 7 else clean_sn
+        return f"{self.PRODUCT_ID}/{short_sn}/down"
 
     def _parse_khmer_integer(self, n: int) -> List[str]:
         """បំប្លែងចំនួនលេខទៅជាកូដសំឡេងតាមវេយ្យាករណ៍រាប់លេខខ្មែរ"""
@@ -105,37 +107,31 @@ class FeishuSupplier(BaseSoundboxSupplier):
 
         codes: List[str] = []
 
-        # ខ្ទង់លាន
         if n >= 1_000_000:
             codes.extend(self._parse_khmer_integer(n // 1_000_000))
             codes.append(self.CODE_MILLION)
             n %= 1_000_000
 
-        # ខ្ទង់សែន
         if n >= 100_000:
             codes.extend(self._parse_khmer_integer(n // 100_000))
             codes.append(self.CODE_HUNDRED_THOUSAND)
             n %= 100_000
 
-        # ខ្ទង់ម៉ឺន
         if n >= 10_000:
             codes.extend(self._parse_khmer_integer(n // 10_000))
             codes.append(self.CODE_TEN_THOUSAND)
             n %= 10_000
 
-        # ខ្ទង់ពាន់
         if n >= 1_000:
             codes.extend(self._parse_khmer_integer(n // 1_000))
             codes.append(self.CODE_THOUSAND)
             n %= 1_000
 
-        # ខ្ទង់រយ
         if n >= 100:
             codes.append(self.DIGITS_MAP[n // 100])
             codes.append(self.CODE_HUNDRED)
             n %= 100
 
-        # ខ្ទង់ដប់ និង ខ្ទង់រាយ
         if n >= 20:
             tens = (n // 10) * 10
             codes.append(self.TENS_MAP[tens])
@@ -152,56 +148,58 @@ class FeishuSupplier(BaseSoundboxSupplier):
     def build_payment_payload(
         self, device_sn: str, amount: float, currency: str, message_id: str
     ) -> Dict[str, Any]:
-        
         codes: List[str] = [self.CODE_PROMPT_RECEIVED]
         curr = currency.strip().upper()
+        clean_sn = re.sub(r"[^A-Za-z0-9]", "", str(device_sn).strip())
+        short_sn = clean_sn[-7:] if len(clean_sn) >= 7 else clean_sn
 
         try:
-            val = max(0.0, float(amount)) # Guard against negatives
+            val = max(0.0, float(amount))
         except (ValueError, TypeError):
-            logger.error("Invalid amount provided: %s. Defaulting to 0.", amount)
             val = 0.0
 
         if curr == "USD":
             dollars = int(val)
             cents = int(round((val - dollars) * 100))
 
-            # Only pronounce dollars if there are dollars, OR if the total is exactly 0
             if dollars > 0 or (dollars == 0 and cents == 0):
                 codes.extend(self._parse_khmer_integer(dollars))
                 codes.append(self.CODE_CURRENCY_USD)
-          
-            # បើមានលុយកាក់ (Cents)
+
             if cents > 0:
                 codes.extend(self._parse_khmer_integer(cents))
                 codes.append(self.CODE_CURRENCY_CENT)
 
             amount_str = f"{val:.2f}" if cents > 0 else str(dollars)
-            
         else:
-            # លំនាំដើមជាប្រាក់រៀល (KHR)
             int_amt = int(round(val))
             codes.extend(self._parse_khmer_integer(int_amt))
             codes.append(self.CODE_CURRENCY_KHR)
             amount_str = str(int_amt)
 
-        # ចងក្រង JSON ផ្ញើទៅ Feishu ម៉ាស៊ីន
+        slice_voice_str = "-".join(codes)
+
+        # គាំទ្រ format ទាំងពីរ (cmd: playAudibleMsg និង broadcast) ដើម្បីឱ្យ firmware ចាប់បានភ្លាម
         payload = {
-            "cmd": "voice",
+            "cmd": "playAudibleMsg",
+            "msgid": message_id,
+            "message_id": message_id,
+            "sn": short_sn,
             "amount": amount_str,
-            "playAudibleMsg": "-".join(codes),
+            "currency": curr,
+            "playAudibleMsg": slice_voice_str,
+            "data": slice_voice_str,
         }
 
         logger.info(
-            "Payload created for %s | Topic: %s | Payload: %s",
-            device_sn, self.get_downlink_topic(device_sn), payload
+            "Payload created for %s | Topic: %s | Slices: %s",
+            device_sn, self.get_downlink_topic(device_sn), slice_voice_str
         )
-
         return payload
 
     def build_get_info_payload(self) -> Dict[str, Any]:
-        """ផ្ញើ Data getinfo ទៅ Soundbox ដើម្បីទាញយកទិន្នន័យ battery, signal, និង status"""
         return {"cmd": "getinfo"}
+
 
 class SupplierFactory:
     """Factory resolving vendor strategy instances."""
@@ -213,5 +211,5 @@ class SupplierFactory:
 
     @classmethod
     def get(cls, supplier_name: Optional[str]) -> BaseSoundboxSupplier:
-        name = (supplier_name or "hemi").strip().lower()
-        return cls._instances.get(name, cls._instances["hemi"])
+        name = (supplier_name or "feishu").strip().lower()
+        return cls._instances.get(name, cls._instances["feishu"])
