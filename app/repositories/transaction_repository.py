@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import asyncpg
 
 logger = logging.getLogger("TransactionRepository")
@@ -12,17 +12,20 @@ class TransactionRepository:
         self._pool = pool
 
     async def get_tx_by_id(self, txid: str) -> Optional[Dict[str, Any]]:
-        """ទាញយកព័ត៌មាន Transaction តាម ID ដើម្បីពិនិត្យស្ថានភាពចាក់សំឡេង។"""
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, device_id, amount, currency, is_played, playback_status, created_at
-                FROM transactions
-                WHERE id = $1
-                """,
-                str(txid).strip(),
-            )
-            return dict(row) if row else None
+        """ទាញយកព័ត៌មាន Transaction តាម ID ដោយ Cast ជា TEXT ដើម្បីចៀសវាង String vs Integer/Bigint error"""
+        query = """
+            SELECT id, device_id, amount, currency, is_played, playback_status, created_at
+            FROM transactions
+            WHERE id::TEXT = $1::TEXT
+            LIMIT 1;
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(query, str(txid).strip())
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error("Error get_tx_by_id for TxID %s: %s", txid, e)
+            return None
 
     async def create_transaction(
         self,
@@ -36,12 +39,10 @@ class TransactionRepository:
         ack_status: str = "MQTT_DELIVERED",
         status: Optional[str] = None,
     ) -> bool:
-        """
-        កត់ត្រា Transaction ថ្មីចូល PostgreSQL។
-        ត្រឡប់ True ប្រសិនបើជោគជ័យ ឬ False ប្រសិនបើមានបញ្ហា/duplicate។
-        """
         final_raw = raw_payload if raw_payload is not None else (raw_text or "")
         final_status = status if status is not None else ack_status
+        clean_txid = str(txid).strip()
+        clean_dev = str(device_id).strip()
 
         query = """
             INSERT INTO transactions (
@@ -62,8 +63,8 @@ class TransactionRepository:
             async with self._pool.acquire() as conn:
                 res = await conn.fetchval(
                     query,
-                    str(txid).strip(),
-                    str(device_id).strip(),
+                    clean_txid,
+                    clean_dev,
                     float(amount),
                     str(currency).strip(),
                     final_raw,
@@ -71,17 +72,17 @@ class TransactionRepository:
                 )
                 return bool(res)
         except Exception as e:
-            logger.error("Failed to insert transaction %s: %s", txid, e)
+            logger.error("Failed to insert transaction %s: %s", clean_txid, e)
             return False
 
     async def update_ack_by_txid(self, txid: str, is_success: bool, status_text: str) -> None:
-        """Update ស្ថានភាពពេលទទួលបាន exact ACK ត្រូវតាម msgid/correlation key។"""
+        """Update ស្ថានភាពពេលទទួលបាន exact ACK ត្រូវតាម msgid"""
         query = """
             UPDATE transactions
             SET is_played = $2,
                 playback_status = $3,
                 updated_at = (NOW() AT TIME ZONE 'Asia/Phnom_Penh')
-            WHERE id = $1;
+            WHERE id::TEXT = $1::TEXT;
         """
         try:
             async with self._pool.acquire() as conn:
@@ -91,7 +92,7 @@ class TransactionRepository:
 
     async def update_fallback_ack(self, device_sn: str, is_success: bool, status_text: str) -> None:
         """
-        Fallback ACK: ស្វែងរក Transaction ចុងក្រោយបំផុតរបស់ Device ដើម្បី Update។
+        Fallback ACK: ស្វែងរក Transaction ចុងក្រោយបង្អស់របស់ Device ដើម្បីកត់ត្រាថាបានលេងរួចរាល់
         """
         clean_sn = str(device_sn).strip()
         query = """
@@ -114,12 +115,12 @@ class TransactionRepository:
             logger.error("Failed to update fallback ACK for SN %s: %s", clean_sn, e)
 
     async def mark_play_timeout(self, txid: str, timeout_status: str = "PLAY_TIMEOUT") -> None:
-        """កំណត់ Transaction ថាផុតកំណត់ ប្រសិនបើមិនទាន់បានលេង។"""
+        """កំណត់ Transaction ថាផុតកំណត់ (PLAY_TIMEOUT) ក្នុង Watchdog"""
         query = """
             UPDATE transactions
             SET playback_status = $2,
                 updated_at = (NOW() AT TIME ZONE 'Asia/Phnom_Penh')
-            WHERE id = $1 AND is_played = FALSE;
+            WHERE id::TEXT = $1::TEXT AND is_played = FALSE;
         """
         try:
             async with self._pool.acquire() as conn:
